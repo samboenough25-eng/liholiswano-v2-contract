@@ -18,6 +18,16 @@ fn deploy(env: &Env) -> Address {
     env.register_contract(None, LiholiswanoContractV2)
 }
 
+/// Initializes the contract with a fresh protocol admin and approves
+/// `token` on the stablecoin allowlist — the setup every test needs before
+/// `create_group` will accept that token.
+fn init_and_approve(env: &Env, contract_id: &Address, token: &Address) {
+    let client = LiholiswanoContractV2Client::new(env, contract_id);
+    let protocol_admin = Address::generate(env);
+    client.initialize(&protocol_admin);
+    client.add_approved_token(&protocol_admin, token);
+}
+
 fn advance_time(env: &Env, by_secs: u64) {
     let now = env.ledger().timestamp();
     env.ledger().set(LedgerInfo {
@@ -38,6 +48,7 @@ fn create_join_lock_happy_path_with_multi_admin() {
     env.mock_all_auths();
     let (token_admin, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin1 = Address::generate(&env);
@@ -85,6 +96,7 @@ fn lock_fails_with_too_few_admin_signatures() {
     env.mock_all_auths();
     let (_, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin1 = Address::generate(&env);
@@ -116,6 +128,7 @@ fn auto_default_after_deadline_and_waitlist_promotion_fills_the_slot() {
     env.mock_all_auths();
     let (_, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -181,6 +194,7 @@ fn promote_out_of_turn_rejected() {
     env.mock_all_auths();
     let (_, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -223,6 +237,7 @@ fn settle_round_conserves_value_with_uneven_split() {
     env.mock_all_auths();
     let (_, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -269,6 +284,7 @@ fn cannot_join_after_lock() {
     env.mock_all_auths();
     let (_, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -300,6 +316,7 @@ fn non_admin_cannot_lock() {
     env.mock_all_auths();
     let (_, token_client, asset_client) = setup(&env);
     let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
     let client = LiholiswanoContractV2Client::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -333,4 +350,106 @@ fn reading_unknown_group_fails() {
     let id = Symbol::new(&env, "nope");
     let result = client.try_get_group_state(&id);
     assert_eq!(result, Err(Ok(Error::GroupNotFound)));
+}
+
+#[test]
+fn create_group_rejects_unapproved_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, token_client, asset_client) = setup(&env);
+    let contract_id = deploy(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &contract_id);
+
+    // Initialize, but deliberately do NOT approve token_client's address —
+    // create_group must refuse it.
+    let protocol_admin = Address::generate(&env);
+    client.initialize(&protocol_admin);
+
+    let admin = Address::generate(&env);
+    let id = Symbol::new(&env, "grp1");
+    let admins = Vec::from_array(&env, [admin.clone()]);
+    let result = client.try_create_group(
+        &id, &admins, &1, &token_client.address, &100, &500, &2000, &10, &(28 * DAY),
+    );
+    assert_eq!(result, Err(Ok(Error::TokenNotApproved)));
+
+    // Sanity: once approved, the identical call succeeds.
+    client.add_approved_token(&protocol_admin, &token_client.address);
+    let m1 = Address::generate(&env);
+    asset_client.mint(&m1, &10_000);
+    let ok = client.try_create_group(
+        &id, &admins, &1, &token_client.address, &100, &500, &2000, &10, &(28 * DAY),
+    );
+    assert!(ok.is_ok());
+}
+
+#[test]
+fn create_group_before_initialize_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, token_client, _) = setup(&env);
+    let contract_id = deploy(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let id = Symbol::new(&env, "grp1");
+    let admins = Vec::from_array(&env, [admin.clone()]);
+    let result = client.try_create_group(
+        &id, &admins, &1, &token_client.address, &100, &500, &2000, &10, &(28 * DAY),
+    );
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn non_protocol_admin_cannot_approve_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, token_client, _) = setup(&env);
+    let contract_id = deploy(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &contract_id);
+
+    let protocol_admin = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    client.initialize(&protocol_admin);
+
+    let result = client.try_add_approved_token(&stranger, &token_client.address);
+    assert_eq!(result, Err(Ok(Error::NotProtocolAdmin)));
+}
+
+#[test]
+fn cannot_initialize_twice() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = deploy(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &contract_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    client.initialize(&admin1);
+    let result = client.try_initialize(&admin2);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+#[test]
+fn list_groups_enumerates_every_created_group_for_automation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, token_client, asset_client) = setup(&env);
+    let contract_id = deploy(&env);
+    init_and_approve(&env, &contract_id, &token_client.address);
+    let client = LiholiswanoContractV2Client::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let admins = Vec::from_array(&env, [admin.clone()]);
+
+    let id1 = Symbol::new(&env, "grp1");
+    let id2 = Symbol::new(&env, "grp2");
+    client.create_group(&id1, &admins, &1, &token_client.address, &100, &500, &2000, &10, &(28 * DAY));
+    client.create_group(&id2, &admins, &1, &token_client.address, &100, &500, &2000, &10, &(28 * DAY));
+
+    let groups = client.list_groups();
+    assert_eq!(groups.len(), 2);
+    assert!(groups.contains(&id1));
+    assert!(groups.contains(&id2));
+    let _ = asset_client; // unused in this test beyond setup's return shape
 }

@@ -56,6 +56,10 @@ pub enum Error {
     AlreadyOnWaitlist = 22,
     NotNextInWaitlist = 23,
     NoOpenSlots = 24,
+    NotInitialized = 25,
+    AlreadyInitialized = 26,
+    TokenNotApproved = 27,
+    NotProtocolAdmin = 28,
 }
 
 // ── Storage types ───────────────────────────────────────────────────────
@@ -104,7 +108,11 @@ pub struct GroupState {
 
 #[contracttype]
 pub enum DataKey {
-    Group(Symbol), // group id -> GroupState
+    Group(Symbol),      // group id -> GroupState
+    ProtocolAdmin,      // Address — controls the approved-token allowlist only,
+                         // has no power over any individual group's funds
+    ApprovedTokens,      // Vec<Address> — the stablecoin allowlist
+    GroupRegistry,       // Vec<Symbol> — every group id ever created, for automation to enumerate
 }
 
 fn get_group(env: &Env, id: &Symbol) -> Result<GroupState, Error> {
@@ -118,6 +126,17 @@ fn put_group(env: &Env, id: &Symbol, state: &GroupState) {
     env.storage()
         .persistent()
         .set(&DataKey::Group(id.clone()), state);
+}
+
+fn get_approved_tokens(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ApprovedTokens)
+        .unwrap_or(Vec::new(env))
+}
+
+fn is_token_approved(env: &Env, token: &Address) -> bool {
+    get_approved_tokens(env).contains(token)
 }
 
 fn find_member_idx(members: &Vec<Member>, addr: &Address) -> Option<u32> {
@@ -174,6 +193,98 @@ pub struct LiholiswanoContractV2;
 
 #[contractimpl]
 impl LiholiswanoContractV2 {
+    /// One-time setup: sets the protocol admin, the only address allowed to
+    /// manage the stablecoin allowlist. This address has NO power over any
+    /// individual group's funds, members, or settlements — it only controls
+    /// which tokens `create_group` will accept. Call once, right after
+    /// deployment.
+    pub fn initialize(env: Env, protocol_admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::ProtocolAdmin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        protocol_admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolAdmin, &protocol_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedTokens, &Vec::<Address>::new(&env));
+        env.storage()
+            .persistent()
+            .set(&DataKey::GroupRegistry, &Vec::<Symbol>::new(&env));
+        Ok(())
+    }
+
+    /// Protocol-admin-only: add a token to the stablecoin allowlist. Every
+    /// new group's `token` must already be on this list — settlements on
+    /// this deployment only ever move an approved stablecoin, never an
+    /// arbitrary or volatile asset.
+    ///
+    /// IMPORTANT — what this function cannot do: nothing on-chain can prove
+    /// a token is genuinely a well-collateralized, 1:1-pegged stablecoin.
+    /// This is a curated allowlist, not an automatic check — it is only as
+    /// trustworthy as the protocol admin's own diligence in verifying each
+    /// token's issuer before adding it (e.g. Circle's USDC contract ID,
+    /// confirmed from Circle's own published address, not a search result).
+    pub fn add_approved_token(env: Env, protocol_admin: Address, token: Address) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolAdmin)
+            .ok_or(Error::NotInitialized)?;
+        if protocol_admin != stored_admin {
+            return Err(Error::NotProtocolAdmin);
+        }
+        protocol_admin.require_auth();
+
+        let mut tokens = get_approved_tokens(&env);
+        if !tokens.contains(&token) {
+            tokens.push_back(token);
+            env.storage().instance().set(&DataKey::ApprovedTokens, &tokens);
+        }
+        Ok(())
+    }
+
+    /// Protocol-admin-only: remove a token from the allowlist. Existing
+    /// groups already using it are unaffected — this only blocks *new*
+    /// groups from being created with it.
+    pub fn remove_approved_token(env: Env, protocol_admin: Address, token: Address) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolAdmin)
+            .ok_or(Error::NotInitialized)?;
+        if protocol_admin != stored_admin {
+            return Err(Error::NotProtocolAdmin);
+        }
+        protocol_admin.require_auth();
+
+        let tokens = get_approved_tokens(&env);
+        let mut filtered: Vec<Address> = Vec::new(&env);
+        for i in 0..tokens.len() {
+            let t = tokens.get(i).unwrap();
+            if t != token {
+                filtered.push_back(t);
+            }
+        }
+        env.storage().instance().set(&DataKey::ApprovedTokens, &filtered);
+        Ok(())
+    }
+
+    pub fn list_approved_tokens(env: Env) -> Vec<Address> {
+        get_approved_tokens(&env)
+    }
+
+    /// Every group id ever created — lets an automation job (e.g. a
+    /// scheduled GitHub Actions run) enumerate groups to call
+    /// `settle_round` on, without needing its own off-chain database.
+    pub fn list_groups(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GroupRegistry)
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Create a new group. `id` must not already exist. Every address in
     /// `admins` must co-sign this call — you can't be made an admin
     /// without your own consent — and `admin_threshold` (1..=admins.len())
@@ -203,6 +314,12 @@ impl LiholiswanoContractV2 {
             || round_duration_secs == 0
         {
             return Err(Error::InvalidConfig);
+        }
+        if !env.storage().instance().has(&DataKey::ProtocolAdmin) {
+            return Err(Error::NotInitialized);
+        }
+        if !is_token_approved(&env, &token) {
+            return Err(Error::TokenNotApproved);
         }
         // Every proposed admin must consent by co-signing group creation.
         let mut seen: Vec<Address> = Vec::new(&env);
@@ -237,6 +354,15 @@ impl LiholiswanoContractV2 {
             open_slots: 0,
         };
         put_group(&env, &id, &state);
+
+        let mut registry: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GroupRegistry)
+            .unwrap_or(Vec::new(&env));
+        registry.push_back(id);
+        env.storage().persistent().set(&DataKey::GroupRegistry, &registry);
+
         Ok(())
     }
 
