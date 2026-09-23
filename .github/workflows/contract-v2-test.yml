@@ -14,12 +14,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust with the wasm target
-        uses: dtolnay/rust-toolchain@stable
-        # This used to pin 1.79.0 as a workaround for a dependency
-        # resolution bug (base64ct/zeroize/derive_arbitrary). That's now
-        # fixed by the committed Cargo.lock — verified by running
-        # `cargo test` clean on stock Rust with no manual pinning — so
-        # this workflow no longer needs to lag behind current Rust.
+        uses: dtolnay/rust-toolchain@1.79.0
+        # Rust 1.79.0 is pinned because the current Soroban SDK 20.x dependency
+        # stack uses ethnum 1.5.0, which does not compile with newer Rust versions.
+        # The contract tests pass successfully with Rust 1.79.0.
 
       - name: Run the v2 contract's unit tests
         working-directory: contract-v2

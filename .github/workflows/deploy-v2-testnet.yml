@@ -19,17 +19,12 @@ jobs:
         run: cargo install --locked stellar-cli
 
       - name: Install Rust with the wasm target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.79.0
         with:
           targets: wasm32-unknown-unknown
-        # The 1.79.0 pin this step used to carry was a workaround for a
-        # dependency bug (base64ct/zeroize/derive_arbitrary version
-        # resolution) that is now fixed by the committed Cargo.lock —
-        # verified by running `cargo test` clean on stock Rust with no
-        # manual pinning. If a future dependency bump reintroduces a
-        # similar conflict, re-add a version pin here rather than
-        # reaching for `--locked` alone, since that only pins versions
-        # already resolved in Cargo.lock.
+        # Rust 1.79.0 is pinned because the current Soroban SDK 20.x dependency
+        # stack uses ethnum 1.5.0, which does not compile with newer Rust versions.
+        # The contract tests pass successfully with Rust 1.79.0.
 
       - name: Confirm the v2 contract's tests still pass
         working-directory: contract-v2
