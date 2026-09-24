@@ -695,3 +695,19 @@ fn manual_default_of_a_contributed_member_forfeits_instead_of_stranding() {
     assert_eq!(st.reserve - before_reserve, 600);
     assert_eq!(st.open_slots, 1);
 }
+
+#[test]
+fn last_eligible_member_cannot_bid_away_their_own_pot() {
+    let env = Env::default();
+    let f = fixture(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &f.cid);
+    play_round(&f, [0, 0, 0]);
+    play_round(&f, [0, 0, 0]);
+    // Round 3: only ms[2] can still win. A 20% bid must be neutralised to 0.
+    play_round(&f, [0, 0, 2000]);
+    assert!(client.get_group_state(&f.id).completed);
+    // Each member won one full pot of 300, so nobody received a bid discount share.
+    assert_eq!(client.get_member(&f.id, &f.ms[2]).total_received, 300);
+    assert_eq!(client.get_member(&f.id, &f.ms[0]).total_received, 300);
+    assert_eq!(client.get_member(&f.id, &f.ms[1]).total_received, 300);
+}
