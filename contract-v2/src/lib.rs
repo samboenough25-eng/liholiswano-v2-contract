@@ -617,7 +617,18 @@ impl LiholiswanoContractV2 {
             return Err(Error::AlreadyBidThisRound);
         }
 
-        m.bid_bps = bid_bps as i32;
+        // The last member still able to win has no competition for the pot, so
+        // a bid could only hand their own money to the others. Force it to 0.
+        let mut remaining: u32 = 0;
+        for i in 0..state.members.len() {
+            let x = state.members.get(i).unwrap();
+            if x.active && !x.won_this_rotation {
+                remaining += 1;
+            }
+        }
+        let effective_bid: u32 = if remaining <= 1 { 0 } else { bid_bps };
+
+        m.bid_bps = effective_bid as i32;
         state.members.set(idx, m);
         put_group(&env, &id, &state);
         Ok(())
