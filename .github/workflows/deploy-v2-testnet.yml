@@ -6,90 +6,197 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     env:
       HAS_ADMIN_SECRET: ${{ secrets.STELLAR_ADMIN_SECRET != '' }}
-      # Circle's Testnet USDC issuer (same value as approve-stablecoins.sh).
+
+      # Circle's Testnet USDC issuer.
+      # This is the same value used by approve-stablecoins.sh.
       USDC_TESTNET_ISSUER: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 
     steps:
+
+      # ------------------------------------------------------------
+      # 1. CHECK OUT THE REPOSITORY
+      # ------------------------------------------------------------
       - name: Check out the repo
         uses: actions/checkout@v4
 
+
+      # ------------------------------------------------------------
+      # 2. INSTALL SYSTEM LIBRARIES
+      # ------------------------------------------------------------
       - name: Install system libraries the Stellar CLI needs
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config libudev-dev libusb-1.0-0-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libudev-dev \
+            libusb-1.0-0-dev
 
-      # Cache the exact Stellar CLI version used by this project.
-      # The cache avoids recompiling the CLI on every deployment.
-      - name: Cache the Stellar CLI binary
-        id: cli-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/stellar
-          key: stellar-cli-${{ runner.os }}-21.5.3
 
-      - name: Install the Stellar CLI (skipped on cache hit)
-        if: steps.cli-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked stellar-cli --version 21.5.3
+      # ------------------------------------------------------------
+      # 3. INSTALL STELLAR CLI
+      #
+      # IMPORTANT:
+      # We no longer use:
+      #
+      # cargo install --locked stellar-cli --version 21.5.3
+      #
+      # That was the step that failed because ethnum 1.5.0
+      # could not compile on the GitHub runner.
+      #
+      # Stellar officially provides this GitHub Action.
+      # ------------------------------------------------------------
+      - name: Install the Stellar CLI
+        uses: stellar/stellar-cli@v23.0.1
 
-      # Rust 1.79.0 is pinned because the current Soroban SDK 20.x
-      # dependency stack uses ethnum 1.5.0, which does not compile
-      # correctly with newer Rust versions.
+
+      # ------------------------------------------------------------
+      # 4. CONFIRM STELLAR CLI WORKS
+      # ------------------------------------------------------------
+      - name: Confirm Stellar CLI installation
+        run: |
+          stellar --version
+
+
+      # ------------------------------------------------------------
+      # 5. INSTALL THE RUST VERSION USED BY THE CONTRACT
+      #
+      # Rust 1.79.0 remains pinned because the current
+      # Soroban SDK 20.x dependency stack uses ethnum 1.5.0.
+      #
+      # We are NOT changing the contract's Rust toolchain here.
+      # ------------------------------------------------------------
       - name: Install Rust 1.79.0 with the wasm target
         uses: dtolnay/rust-toolchain@1.79.0
         with:
           targets: wasm32-unknown-unknown
 
+
+      # ------------------------------------------------------------
+      # 6. CONFIRM RUST VERSION
+      # ------------------------------------------------------------
+      - name: Confirm Rust version
+        run: |
+          rustc --version
+          cargo --version
+
+
+      # ------------------------------------------------------------
+      # 7. RUN THE CONTRACT TESTS
+      #
+      # This must pass before deployment is attempted.
+      # ------------------------------------------------------------
       - name: Confirm the tests still pass
         working-directory: contract-v2
-        run: cargo test --locked
+        run: |
+          cargo test --locked
 
+
+      # ------------------------------------------------------------
+      # 8. BUILD THE CONTRACT TO WASM
+      # ------------------------------------------------------------
       - name: Build the contract to wasm
         working-directory: contract-v2
-        run: stellar contract build
+        run: |
+          stellar contract build
 
+
+      # ------------------------------------------------------------
+      # 9. CONFIRM THE WASM FILE EXISTS
+      # ------------------------------------------------------------
+      - name: Confirm WASM build output
+        working-directory: contract-v2
+        run: |
+          WASM_PATH="target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm"
+
+          if [ ! -f "$WASM_PATH" ]; then
+            echo "::error::Expected WASM file was not found:"
+            echo "$WASM_PATH"
+            exit 1
+          fi
+
+          echo "WASM file found:"
+          ls -lh "$WASM_PATH"
+
+
+      # ------------------------------------------------------------
+      # 10. SET UP THE ADMIN IDENTITY
+      #
+      # If STELLAR_ADMIN_SECRET already exists:
+      #     reuse it.
+      #
+      # If it does not exist:
+      #     generate a new Testnet identity and fund it.
+      # ------------------------------------------------------------
       - name: Set up the admin identity
         env:
           ADMIN_SECRET: ${{ secrets.STELLAR_ADMIN_SECRET }}
+
         run: |
           if [ -n "$ADMIN_SECRET" ]; then
             echo "Reusing the saved admin identity"
+
             printf '%s\n' "$ADMIN_SECRET" | stellar keys add admin
+
           else
-            echo "No saved admin identity yet - generating and funding a new one on Testnet"
+            echo "No saved admin identity yet."
+            echo "Generating and funding a new Testnet admin identity."
+
             stellar keys generate admin --network testnet --fund
           fi
 
-          echo "Admin public key (safe to share): $(stellar keys address admin)"
+          echo "Admin public key (safe to share):"
+          stellar keys address admin
 
-      # First run only.
-      # The secret is sent directly to GitHub's encrypted secret store
-      # and is never printed into the Actions log.
+
+      # ------------------------------------------------------------
+      # 11. SAVE THE NEW ADMIN SECRET
+      #
+      # FIRST RUN ONLY.
+      #
+      # The secret is piped directly into GitHub's secret store.
+      # It is NOT printed into the Actions log.
+      # ------------------------------------------------------------
       - name: Save the new admin identity as a repo secret (first run only)
         if: ${{ env.HAS_ADMIN_SECRET == 'false' }}
+
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_SECRETS }}
+
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::GH_PAT_FOR_SECRETS is not set. Create a fine-grained PAT scoped to this repo with Secrets: write and save it as GH_PAT_FOR_SECRETS first."
+            echo "::error::GH_PAT_FOR_SECRETS is not set."
+            echo "::error::Create the required GitHub token and save it as GH_PAT_FOR_SECRETS."
             exit 1
           fi
 
           stellar keys secret admin | gh secret set STELLAR_ADMIN_SECRET --repo "${{ github.repository }}"
 
-          echo "Admin secret saved to STELLAR_ADMIN_SECRET. It was never printed."
+          echo "Admin secret saved to STELLAR_ADMIN_SECRET."
+          echo "The secret itself was never printed."
 
+
+      # ------------------------------------------------------------
+      # 12. DEPLOY THE CONTRACT
+      # ------------------------------------------------------------
       - name: Deploy the contract
         id: deploy
         working-directory: contract-v2
-        run: |
-          WASM_PATH=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "liholiswano_contract_v2.wasm" | head -n1)
 
-          if [ -z "$WASM_PATH" ]; then
-            echo "::error::wasm not found in target/wasm32-unknown-unknown/release"
+        run: |
+          WASM_PATH="target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm"
+
+          if [ ! -f "$WASM_PATH" ]; then
+            echo "::error::WASM not found:"
+            echo "$WASM_PATH"
             exit 1
           fi
 
-          echo "Using wasm at: $WASM_PATH"
+          echo "Using WASM:"
+          echo "$WASM_PATH"
 
           CONTRACT_ID=$(stellar contract deploy \
             --wasm "$WASM_PATH" \
@@ -97,10 +204,20 @@ jobs:
             --source-account admin)
 
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
-          echo "Liholiswano v2 contract ID: $CONTRACT_ID"
 
-      # WITHOUT THIS STEP every create_group call fails with NotInitialized.
-      # initialize is first-caller-wins, so it runs immediately after deployment.
+          echo "Liholiswano v2 contract ID:"
+          echo "$CONTRACT_ID"
+
+
+      # ------------------------------------------------------------
+      # 13. INITIALIZE THE CONTRACT
+      #
+      # WITHOUT THIS STEP:
+      # create_group calls will fail with NotInitialized.
+      #
+      # initialize is first-caller-wins, so it must happen
+      # immediately after deployment.
+      # ------------------------------------------------------------
       - name: Initialize the contract (sets the protocol admin)
         run: |
           stellar contract invoke \
@@ -110,21 +227,36 @@ jobs:
             -- initialize \
             --protocol_admin "$(stellar keys address admin)"
 
+
+      # ------------------------------------------------------------
+      # 14. DEPLOY TESTNET USDC SAC IF NECESSARY
+      #     AND APPROVE IT IN THE CONTRACT
+      # ------------------------------------------------------------
       - name: Make sure Testnet USDC has a token contract, then approve it
         run: |
+
+          echo "Checking/deploying Testnet USDC Stellar Asset Contract..."
+
           # Deploy the Stellar Asset Contract for USDC if necessary.
           # If it already exists, continue.
           stellar contract asset deploy \
             --asset "USDC:${USDC_TESTNET_ISSUER}" \
             --source-account admin \
-            --network testnet || echo "USDC SAC already deployed - continuing"
+            --network testnet \
+            || echo "USDC SAC already deployed - continuing"
 
+
+          # Find the USDC SAC contract ID.
           USDC_SAC=$(stellar contract id asset \
             --asset "USDC:${USDC_TESTNET_ISSUER}" \
             --network testnet)
 
-          echo "USDC-testnet token contract: $USDC_SAC"
 
+          echo "USDC-testnet token contract:"
+          echo "$USDC_SAC"
+
+
+          # Approve USDC inside the Liholiswano protocol.
           stellar contract invoke \
             --id "${{ steps.deploy.outputs.contract_id }}" \
             --source-account admin \
@@ -133,7 +265,9 @@ jobs:
             --protocol_admin "$(stellar keys address admin)" \
             --token "$USDC_SAC"
 
+
           echo "Approved tokens now:"
+
 
           stellar contract invoke \
             --id "${{ steps.deploy.outputs.contract_id }}" \
@@ -141,13 +275,19 @@ jobs:
             --network testnet \
             -- list_approved_tokens
 
+
+      # ------------------------------------------------------------
+      # 15. GITHUB ACTIONS SUMMARY
+      # ------------------------------------------------------------
       - name: Summary
         run: |
           {
-            echo "### Liholiswano v2 deployed to Testnet"
+            echo "### Liholiswano v2 deployed to Stellar Testnet"
             echo ""
             echo "Contract ID: \`${{ steps.deploy.outputs.contract_id }}\`"
             echo ""
-            echo "Save this as the repo secret STELLAR_CONTRACT_ID (used by auto-settle.yml)."
-            echo "Testnet is periodically reset by SDF - if this ID stops working, redeploy."
+            echo "Save this as the repo secret STELLAR_CONTRACT_ID if required by auto-settle.yml."
+            echo ""
+            echo "Testnet is periodically reset by SDF."
+            echo "If this contract ID stops working after a Testnet reset, redeploy."
           } >> "$GITHUB_STEP_SUMMARY"
