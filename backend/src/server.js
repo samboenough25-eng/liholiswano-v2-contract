@@ -20,6 +20,7 @@ const sign=u=>jwt.sign({sub:u.id,role:u.role},process.env.JWT_SECRET,{expiresIn:
 const auth=(req,res,next)=>{try{const h=req.headers.authorization||'';if(!h.startsWith('Bearer '))return res.status(401).json({error:'Authentication required'});req.user=jwt.verify(h.slice(7),process.env.JWT_SECRET);next()}catch{return res.status(401).json({error:'Invalid or expired session'})}};
 const role=(...roles)=>(req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:'Insufficient permission'});
 const audit=async(req,action,metadata={})=>{try{await pool.query('insert into audit_log(user_id,action,ip,metadata) values($1,$2,$3,$4)',[req.user?.sub||null,action,req.ip,metadata])}catch{}};
+const kycVerified=async(req,res,next)=>{const r=await pool.query('select kyc_status from users where id=$1',[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:'User not found'});if(r.rows[0].kyc_status!=='verified')return res.status(403).json({error:'KYC verification is required before this financial operation',kyc_status:r.rows[0].kyc_status});next()};
 
 app.get('/health',async(_,res)=>{try{await pool.query('select 1');res.json({ok:true,service:'liholiswano-api',network:process.env.STELLAR_NETWORK||'testnet'})}catch{res.status(503).json({ok:false})}});
 
