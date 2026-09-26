@@ -15,10 +15,16 @@ jobs:
 
       - name: Install Rust with the wasm target
         uses: dtolnay/rust-toolchain@1.79.0
-        # Rust 1.79.0 is pinned because the current Soroban SDK 20.x dependency
-        # stack uses ethnum 1.5.0, which does not compile with newer Rust versions.
-        # The contract tests pass successfully with Rust 1.79.0.
+        with:
+          targets: wasm32-unknown-unknown
+        # KEEP THIS PIN. Soroban SDK 20.x pulls ethnum 1.5.0, which does not
+        # compile on current stable rustc (E0512 in error.rs) - this was seen
+        # live on GitHub Actions. Old-SDK wasm output is also only known-good
+        # on older Rust. Do not switch to @stable without a real Actions run
+        # proving it works. (Local Rust 1.75 passing proves nothing about this.)
 
-      - name: Run the v2 contract's unit tests
+      - name: Run the contract's unit tests against the committed lockfile
         working-directory: contract-v2
-        run: cargo test
+        # --locked makes CI FAIL if Cargo.lock is missing or out of date,
+        # instead of silently re-resolving to versions that break the build.
+        run: cargo test --locked

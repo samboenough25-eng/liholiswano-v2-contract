@@ -1,3 +1,21 @@
+//! Liholiswano Protocol V2.2 — Soroban contract.
+//!
+//! V2.2 (this revision) closes the money-exit gaps found in review of V2.1:
+//!   * A group now has a defined END: after every active member has won once
+//!     the group is `completed`, and each non-defaulted member can
+//!     `claim_refund` their collateral plus an equal share of whatever is
+//!     left in the reserve. (V2.1 had no way for collateral to leave.)
+//!   * The reserve now actually covers the shortfall a defaulter leaves:
+//!     each round the missing contributions are topped up from the reserve
+//!     (their collateral) before the pot is paid; only what the reserve
+//!     cannot cover reduces the pot and is logged as bad debt.
+//!   * A member who defaults after already contributing this round forfeits
+//!     that contribution into the reserve (V2.1 stranded it in the contract).
+//!   * `max_members` is capped, collateral must cover a first-slot default
+//!     at lock time, and storage TTLs are extended on every write so a group
+//!     cannot silently expire mid-cycle.
+//!
+//! ── Original V2.1 header ──
 //! Liholiswano Protocol V2.1 — Soroban contract, expanded pilot scope.
 //!
 //! Builds on the pilot contract by adding the four features the first
@@ -60,7 +78,24 @@ pub enum Error {
     AlreadyInitialized = 26,
     TokenNotApproved = 27,
     NotProtocolAdmin = 28,
+    AlreadyCompleted = 29,
+    NotCompleted = 30,
+    AlreadyClaimed = 31,
+    CollateralTooLow = 32,
 }
+
+// ── Limits & TTL policy ─────────────────────────────────────────────────
+
+/// Upper bound on members per group. A group's whole state lives in ONE
+/// ledger entry and `settle_round` does O(n) token transfers, so an
+/// unbounded group can become impossible to settle. Measure before raising.
+pub const MAX_MEMBERS: u32 = 50;
+
+/// Soroban state archival: entries expire unless their TTL is extended.
+/// ~17,280 ledgers/day at 5s per ledger. Whenever remaining TTL drops below
+/// the threshold (30 days) we top it up to 120 days.
+const TTL_THRESHOLD: u32 = 30 * 17_280;
+const TTL_EXTEND_TO: u32 = 120 * 17_280;
 
 // ── Storage types ───────────────────────────────────────────────────────
 
@@ -89,6 +124,7 @@ pub struct Member {
     pub total_wins: u32,
     pub total_contributed: i128,
     pub total_received: i128,   // net payouts + bonuses, for the member's own dashboard
+    pub refunded: bool,         // true once claim_refund has paid this member out
 }
 
 #[contracttype]
@@ -104,6 +140,9 @@ pub struct GroupState {
     pub total_uncovered_shortfall: i128, // running bad-debt tally, always visible on-chain
     pub round_deadline: u64,             // ledger timestamp; past this, settle_round may auto-default
     pub open_slots: u32,                 // slots freed by default, fillable from the waitlist
+    pub slots: u32,                      // member count fixed at lock: the size of a FULL pot is slots * contribution
+    pub completed: bool,                 // true once every active member has won; refunds open
+    pub refund_share: i128,              // each surviving member's equal share of the leftover reserve
 }
 
 #[contracttype]
@@ -123,9 +162,19 @@ fn get_group(env: &Env, id: &Symbol) -> Result<GroupState, Error> {
 }
 
 fn put_group(env: &Env, id: &Symbol, state: &GroupState) {
+    let key = DataKey::Group(id.clone());
+    env.storage().persistent().set(&key, state);
+    // Keep the group, the registry and the contract instance alive. Any
+    // write (including the keeper's scheduled settle calls) tops them up.
     env.storage()
         .persistent()
-        .set(&DataKey::Group(id.clone()), state);
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::GroupRegistry, TTL_THRESHOLD, TTL_EXTEND_TO);
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 fn get_approved_tokens(env: &Env) -> Vec<Address> {
@@ -308,6 +357,7 @@ impl LiholiswanoContractV2 {
             || collateral < 0
             || max_bid_bps > 5000
             || max_members < 3
+            || max_members > MAX_MEMBERS
             || admins.len() == 0
             || admin_threshold == 0
             || admin_threshold > admins.len()
@@ -352,6 +402,9 @@ impl LiholiswanoContractV2 {
             total_uncovered_shortfall: 0,
             round_deadline: 0,
             open_slots: 0,
+            slots: 0,
+            completed: false,
+            refund_share: 0,
         };
         put_group(&env, &id, &state);
 
@@ -401,6 +454,7 @@ impl LiholiswanoContractV2 {
             total_wins: 0,
             total_contributed: 0,
             total_received: 0,
+            refunded: false,
         });
         put_group(&env, &id, &state);
         Ok(())
@@ -431,6 +485,9 @@ impl LiholiswanoContractV2 {
         member.require_auth();
         let mut state = get_group(&env, &id)?;
 
+        if state.completed {
+            return Err(Error::AlreadyCompleted);
+        }
         if state.open_slots == 0 {
             return Err(Error::NoOpenSlots);
         }
@@ -462,6 +519,7 @@ impl LiholiswanoContractV2 {
             total_wins: 0,
             total_contributed: 0,
             total_received: 0,
+            refunded: false,
         });
         put_group(&env, &id, &state);
         Ok(())
@@ -480,7 +538,15 @@ impl LiholiswanoContractV2 {
         if state.members.len() < 3 {
             return Err(Error::TooFewMembersToLock);
         }
+        // The first member to win can default having received a full pot and
+        // still owe (n-1) contributions. Collateral must at least cover that
+        // or the group is unsafe by construction.
+        let owed_by_first_winner = ((state.members.len() - 1) as i128) * state.config.contribution;
+        if state.config.collateral < owed_by_first_winner {
+            return Err(Error::CollateralTooLow);
+        }
 
+        state.slots = state.members.len();
         state.locked = true;
         state.round = 1;
         state.rotation = 1;
@@ -496,6 +562,9 @@ impl LiholiswanoContractV2 {
 
         if !state.locked {
             return Err(Error::NotLocked);
+        }
+        if state.completed {
+            return Err(Error::AlreadyCompleted);
         }
         let idx = find_member_idx(&state.members, &member).ok_or(Error::NotAMember)?;
         let mut m = state.members.get(idx).unwrap();
@@ -530,6 +599,9 @@ impl LiholiswanoContractV2 {
         if !state.locked {
             return Err(Error::NotLocked);
         }
+        if state.completed {
+            return Err(Error::AlreadyCompleted);
+        }
         if bid_bps > state.config.max_bid_bps {
             return Err(Error::BidTooHigh);
         }
@@ -545,7 +617,18 @@ impl LiholiswanoContractV2 {
             return Err(Error::AlreadyBidThisRound);
         }
 
-        m.bid_bps = bid_bps as i32;
+        // The last member still able to win has no competition for the pot, so
+        // a bid could only hand their own money to the others. Force it to 0.
+        let mut remaining: u32 = 0;
+        for i in 0..state.members.len() {
+            let x = state.members.get(i).unwrap();
+            if x.active && !x.won_this_rotation {
+                remaining += 1;
+            }
+        }
+        let effective_bid: u32 = if remaining <= 1 { 0 } else { bid_bps };
+
+        m.bid_bps = effective_bid as i32;
         state.members.set(idx, m);
         put_group(&env, &id, &state);
         Ok(())
@@ -554,32 +637,31 @@ impl LiholiswanoContractV2 {
     /// Settle the round. Two ways this can succeed:
     ///
     /// 1. Before the deadline: only once every active member has
-    ///    contributed and every eligible member has bid — same as the
-    ///    first pilot, unchanged.
+    ///    contributed and every eligible member has bid.
     /// 2. At or after the deadline: anyone may call this even if some
-    ///    active members never contributed or bid. Those stragglers are
-    ///    automatically defaulted first (collateral seized into the
-    ///    reserve, a slot opened for the waitlist, and — if they'd already
-    ///    won this rotation — their remaining obligation is covered by
-    ///    that collateral with any true gap logged as bad debt, exactly
-    ///    like the manual default path). Any active member who contributed
-    ///    but never bid is treated as having bid 0 (no rush) rather than
-    ///    blocking the round. Settlement then proceeds among whoever is
-    ///    left active.
+    ///    active members never contributed or bid. Stragglers are
+    ///    defaulted automatically (collateral -> reserve, slot opened for
+    ///    the waitlist); a missing bid counts as a 0% bid.
     ///
-    /// The rest of the payout math (highest-bid wins, floor-split bonus
-    /// with the remainder to reserve) is identical to the first pilot.
+    /// Pot = contributions actually collected + a top-up from the reserve
+    /// for every contribution a defaulted seat failed to make (capped by
+    /// the reserve). Whatever the reserve cannot cover reduces the pot and
+    /// is added to `total_uncovered_shortfall` (explicit bad debt).
+    ///
+    /// When the last eligible member has won, the group is `completed` and
+    /// members may `claim_refund`.
     pub fn settle_round(env: Env, id: Symbol) -> Result<(), Error> {
         let mut state = get_group(&env, &id)?;
         if !state.locked {
             return Err(Error::NotLocked);
         }
+        if state.completed {
+            return Err(Error::AlreadyCompleted);
+        }
 
         let now = env.ledger().timestamp();
         let deadline_passed = now >= state.round_deadline;
 
-        // Gate: before the deadline, everyone must have acted. At/after
-        // the deadline, auto-resolve stragglers instead of blocking.
         let mut i = 0;
         while i < state.members.len() {
             let m = state.members.get(i).unwrap();
@@ -587,17 +669,10 @@ impl LiholiswanoContractV2 {
                 if !deadline_passed {
                     return Err(Error::NotAllContributed);
                 }
-                auto_default_member(&env, &mut state, i);
-                // Don't advance i — the member at this index changed.
-                continue;
+                auto_default_member(&mut state, i);
+                continue; // the member at this index is now inactive; loop re-checks and advances
             }
             i += 1;
-        }
-
-        let n_active = active_count(&state.members);
-        if n_active == 0 {
-            put_group(&env, &id, &state);
-            return Err(Error::NothingToSettle);
         }
 
         let mut eligible_idxs: Vec<u32> = Vec::new(&env);
@@ -608,50 +683,33 @@ impl LiholiswanoContractV2 {
                     if !deadline_passed {
                         return Err(Error::NotAllBid);
                     }
-                    // No bid by the deadline = treated as a 0% bid.
-                    m.bid_bps = 0;
+                    m.bid_bps = 0; // no bid by the deadline = 0% bid
                     state.members.set(i, m.clone());
                 }
                 eligible_idxs.push_back(i);
             }
         }
 
-        // If nobody was eligible, the rotation just completed — reset and
-        // treat every active member as freshly eligible for the new one.
+        // Nobody left who can win (everyone still active has already won,
+        // or every remaining un-won member defaulted): the cycle is over.
         if eligible_idxs.len() == 0 {
-            for i in 0..state.members.len() {
-                let mut m = state.members.get(i).unwrap();
-                if m.active {
-                    m.won_this_rotation = false;
-                    state.members.set(i, m);
-                }
-            }
-            state.rotation += 1;
-            for i in 0..state.members.len() {
-                let mut m = state.members.get(i).unwrap();
-                if m.active {
-                    if m.bid_bps < 0 {
-                        if !deadline_passed {
-                            return Err(Error::NotAllBid);
-                        }
-                        m.bid_bps = 0;
-                        state.members.set(i, m.clone());
-                    }
-                    eligible_idxs.push_back(i);
-                }
-            }
-        }
-
-        // n_active may have dropped if the reset loop above ran after more
-        // auto-defaults were already applied; recompute for the payout math.
-        let n_active = active_count(&state.members);
-        if n_active == 0 {
+            close_cycle(&mut state);
             put_group(&env, &id, &state);
-            return Err(Error::NothingToSettle);
+            return Ok(());
         }
 
-        // Winner = highest bid; ties broken by lowest member index (stable,
-        // matches the simulator's tie-break rule so results are comparable).
+        let n_active = active_count(&state.members);
+        let contribution = state.config.contribution;
+
+        let expected_pot: i128 = (state.slots as i128) * contribution;
+        let collected: i128 = (n_active as i128) * contribution;
+        let gap: i128 = if expected_pot > collected { expected_pot - collected } else { 0 };
+        let cover: i128 = if gap < state.reserve { gap } else { state.reserve };
+        state.reserve -= cover;
+        state.total_uncovered_shortfall += gap - cover;
+        let pot: i128 = collected + cover;
+
+        // Winner = highest bid; ties broken by lowest member index.
         let mut winner_pos = eligible_idxs.get(0).unwrap();
         let mut winner_bid = state.members.get(winner_pos).unwrap().bid_bps;
         for k in 1..eligible_idxs.len() {
@@ -663,7 +721,6 @@ impl LiholiswanoContractV2 {
             }
         }
 
-        let pot: i128 = (n_active as i128) * state.config.contribution;
         let bid_amount: i128 = (pot * (winner_bid as i128)) / 10_000;
         let net_to_winner: i128 = pot - bid_amount;
 
@@ -690,7 +747,6 @@ impl LiholiswanoContractV2 {
                 token_client.transfer(&env.current_contract_address(), &m.addr, &share);
                 m.total_received += share;
             }
-            // Reset per-round flags for the next round.
             m.contributed_this_round = false;
             m.bid_bps = -1;
             state.members.set(i, m);
@@ -699,7 +755,52 @@ impl LiholiswanoContractV2 {
         state.reserve += remainder;
         state.round += 1;
         state.round_deadline = now + state.config.round_duration_secs;
+
+        // Did that win use up the last un-won active member?
+        let mut anyone_left = false;
+        for i in 0..state.members.len() {
+            let m = state.members.get(i).unwrap();
+            if m.active && !m.won_this_rotation {
+                anyone_left = true;
+                break;
+            }
+        }
+        if !anyone_left {
+            close_cycle(&mut state);
+        }
+
         put_group(&env, &id, &state);
+        Ok(())
+    }
+
+    /// After the group is `completed`: pays a surviving (non-defaulted)
+    /// member their collateral back plus an equal share of the leftover
+    /// reserve. Each member can claim once. Defaulted members forfeit both.
+    pub fn claim_refund(env: Env, id: Symbol, member: Address) -> Result<(), Error> {
+        member.require_auth();
+        let mut state = get_group(&env, &id)?;
+        if !state.completed {
+            return Err(Error::NotCompleted);
+        }
+        let idx = find_member_idx(&state.members, &member).ok_or(Error::NotAMember)?;
+        let mut m = state.members.get(idx).unwrap();
+        if m.defaulted || !m.active {
+            return Err(Error::MemberNotActive);
+        }
+        if m.refunded {
+            return Err(Error::AlreadyClaimed);
+        }
+
+        let amount: i128 = state.config.collateral + state.refund_share;
+        m.refunded = true;
+        m.total_received += amount;
+        state.members.set(idx, m);
+        put_group(&env, &id, &state);
+
+        if amount > 0 {
+            let token_client = token::Client::new(&env, &state.config.token);
+            token_client.transfer(&env.current_contract_address(), &member, &amount);
+        }
         Ok(())
     }
 
@@ -715,6 +816,9 @@ impl LiholiswanoContractV2 {
     ) -> Result<(), Error> {
         let mut state = get_group(&env, &id)?;
         require_admin_threshold(&env, &state.config, &admins)?;
+        if state.completed {
+            return Err(Error::AlreadyCompleted);
+        }
 
         let idx = find_member_idx(&state.members, &member).ok_or(Error::NotAMember)?;
         let m = state.members.get(idx).unwrap();
@@ -722,7 +826,21 @@ impl LiholiswanoContractV2 {
             return Err(Error::MemberAlreadyDefaulted);
         }
 
-        auto_default_member(&env, &mut state, idx);
+        auto_default_member(&mut state, idx);
+
+        // If that was the last un-won active member, nobody can win any more:
+        // end the cycle now so honest members aren't left waiting.
+        let mut anyone_left = false;
+        for i in 0..state.members.len() {
+            let x = state.members.get(i).unwrap();
+            if x.active && !x.won_this_rotation {
+                anyone_left = true;
+                break;
+            }
+        }
+        if !anyone_left {
+            close_cycle(&mut state);
+        }
         put_group(&env, &id, &state);
         Ok(())
     }
@@ -740,38 +858,47 @@ impl LiholiswanoContractV2 {
     }
 }
 
-/// Shared default logic for both the automatic (deadline-triggered) and
-/// manual (admin-triggered) paths: seizes collateral into the reserve,
-/// covers as much of any still-owed future contributions as that
-/// collateral allows (logging only the genuine gap as bad debt, never
-/// fabricating it), marks the member inactive, and opens a slot for the
-/// waitlist. Mutates `state` in place; the caller is responsible for
-/// persisting it.
-fn auto_default_member(env: &Env, state: &mut GroupState, idx: u32) {
+/// Shared default logic for the automatic (deadline) and manual (admin)
+/// paths. The defaulter's collateral moves into the reserve; if they had
+/// already contributed this round, that contribution is forfeited into the
+/// reserve too (otherwise it would be stranded in the contract). The
+/// reserve then tops up each later pot for the seat's missing contributions
+/// (see `settle_round`), so any shortfall is booked when it actually bites,
+/// not estimated up front. Mutates `state`; the caller persists it.
+fn auto_default_member(state: &mut GroupState, idx: u32) {
     let mut m = state.members.get(idx).unwrap();
-    let collateral = state.config.collateral;
-    let mut uncovered: i128 = 0;
-
-    if m.won_this_rotation {
-        let mut still_to_win: i128 = 0;
-        for i in 0..state.members.len() {
-            let other = state.members.get(i).unwrap();
-            if other.active && !other.won_this_rotation && other.addr != m.addr {
-                still_to_win += 1;
-            }
-        }
-        let owed = still_to_win * state.config.contribution;
-        let covered = if owed < collateral { owed } else { collateral };
-        uncovered = owed - covered;
+    if m.contributed_this_round {
+        state.reserve += state.config.contribution;
+        m.contributed_this_round = false;
     }
-
     m.active = false;
     m.defaulted = true;
     state.members.set(idx, m);
-    state.reserve += collateral;
-    state.total_uncovered_shortfall += uncovered;
+    state.reserve += state.config.collateral;
     state.open_slots += 1;
-    let _ = env; // reserved for future use (e.g. events); keeps the signature stable
+}
+
+/// Ends the cycle: any contributions already paid into the (now
+/// pot-less) current round go to the reserve, the reserve is split equally
+/// among surviving members (dust stays in `reserve`), and refunds open.
+fn close_cycle(state: &mut GroupState) {
+    let mut survivors: i128 = 0;
+    for i in 0..state.members.len() {
+        let mut m = state.members.get(i).unwrap();
+        if m.active {
+            survivors += 1;
+            if m.contributed_this_round {
+                state.reserve += state.config.contribution;
+                m.contributed_this_round = false;
+                state.members.set(i, m);
+            }
+        }
+    }
+    let share: i128 = if survivors > 0 { state.reserve / survivors } else { 0 };
+    state.refund_share = share;
+    state.reserve -= share * survivors;
+    state.completed = true;
+    state.open_slots = 0;
 }
 
 mod test;

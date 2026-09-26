@@ -174,7 +174,10 @@ fn auto_default_after_deadline_and_waitlist_promotion_fills_the_slot() {
     let m3_state = client.get_member(&id, &m3);
     assert!(m3_state.defaulted);
     assert!(!m3_state.active);
-    assert_eq!(state.reserve, 500); // m3's seized collateral
+    // m3's 500 collateral was seized into the reserve, and settling this
+    // round immediately topped the pot up by the 100 m3 failed to pay.
+    assert_eq!(state.reserve, 400);
+    assert_eq!(state.total_uncovered_shortfall, 0);
     assert_eq!(state.open_slots, 1);
     assert_eq!(active_count(&state.members), 2);
 
@@ -452,4 +455,259 @@ fn list_groups_enumerates_every_created_group_for_automation() {
     assert!(groups.contains(&id1));
     assert!(groups.contains(&id2));
     let _ = asset_client; // unused in this test beyond setup's return shape
+}
+
+
+// ───────────────────── V2.2 tests: money exits, reserve, limits ─────────────────────
+
+struct Fixture<'a> {
+    env: &'a Env,
+    cid: Address,
+    tok: token::Client<'a>,
+    id: Symbol,
+    admins: Vec<Address>,
+    ms: [Address; 3],
+}
+
+fn fixture<'a>(env: &'a Env) -> Fixture<'a> {
+    env.mock_all_auths();
+    let (_, tok, asset) = setup(env);
+    let cid = deploy(env);
+    init_and_approve(env, &cid, &tok.address);
+    let client = LiholiswanoContractV2Client::new(env, &cid);
+    let admin = Address::generate(env);
+    let ms = [Address::generate(env), Address::generate(env), Address::generate(env)];
+    for m in ms.iter() {
+        asset.mint(m, &10_000);
+    }
+    let id = Symbol::new(env, "grp1");
+    let admins = Vec::from_array(env, [admin]);
+    client.create_group(&id, &admins, &1, &tok.address, &100, &500, &2000, &10, &(28 * DAY));
+    for m in ms.iter() {
+        client.join_group(&id, m);
+    }
+    client.lock_group(&id, &admins);
+    Fixture { env, cid, tok, id, admins, ms }
+}
+
+fn play_round(f: &Fixture, bids: [u32; 3]) {
+    let client = LiholiswanoContractV2Client::new(f.env, &f.cid);
+    for m in f.ms.iter() {
+        client.contribute(&f.id, m);
+    }
+    for (m, b) in f.ms.iter().zip(bids.iter()) {
+        // a member who already won this rotation can't bid; that is fine
+        let _ = client.try_submit_bid(&f.id, m, b);
+    }
+    client.settle_round(&f.id);
+}
+
+#[test]
+fn full_cycle_completes_and_every_unit_leaves_the_contract() {
+    let env = Env::default();
+    let f = fixture(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &f.cid);
+
+    play_round(&f, [0, 0, 0]);
+    play_round(&f, [0, 0, 0]);
+    assert!(!client.get_group_state(&f.id).completed);
+    play_round(&f, [0, 0, 0]);
+
+    let st = client.get_group_state(&f.id);
+    assert!(st.completed, "cycle must complete once all 3 have won");
+    assert_eq!(st.refund_share, 0);
+
+    // Contributions can no longer be made, and settle is closed.
+    assert_eq!(client.try_contribute(&f.id, &f.ms[0]), Err(Ok(Error::AlreadyCompleted)));
+    assert_eq!(client.try_settle_round(&f.id), Err(Ok(Error::AlreadyCompleted)));
+
+    for m in f.ms.iter() {
+        client.claim_refund(&f.id, m);
+    }
+    // Everyone is exactly whole again: paid 300 in, won 300, got 500 back.
+    for m in f.ms.iter() {
+        assert_eq!(f.tok.balance(m), 10_000);
+    }
+    assert_eq!(f.tok.balance(&f.cid), 0);
+}
+
+#[test]
+fn refund_cannot_be_claimed_twice_or_early() {
+    let env = Env::default();
+    let f = fixture(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &f.cid);
+    assert_eq!(client.try_claim_refund(&f.id, &f.ms[0]), Err(Ok(Error::NotCompleted)));
+    play_round(&f, [0, 0, 0]);
+    play_round(&f, [0, 0, 0]);
+    play_round(&f, [0, 0, 0]);
+    client.claim_refund(&f.id, &f.ms[0]);
+    assert_eq!(client.try_claim_refund(&f.id, &f.ms[0]), Err(Ok(Error::AlreadyClaimed)));
+}
+
+#[test]
+fn reserve_tops_up_pot_when_a_winner_defaults_and_leftover_is_refunded() {
+    let env = Env::default();
+    let f = fixture(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &f.cid);
+
+    // Round 1: ms[0] wins (bids 5% -> pays 15 of the 300 pot, split 7/7, 1 dust to reserve).
+    for m in f.ms.iter() {
+        client.contribute(&f.id, m);
+    }
+    client.submit_bid(&f.id, &f.ms[0], &500);
+    client.submit_bid(&f.id, &f.ms[1], &0);
+    client.submit_bid(&f.id, &f.ms[2], &0);
+    client.settle_round(&f.id);
+    assert_eq!(client.get_group_state(&f.id).reserve, 1);
+
+    // Round 2: ms[0] (already paid out) stops paying.
+    client.contribute(&f.id, &f.ms[1]);
+    client.contribute(&f.id, &f.ms[2]);
+    client.submit_bid(&f.id, &f.ms[1], &0);
+    client.submit_bid(&f.id, &f.ms[2], &0);
+    advance_time(&env, 29 * DAY);
+    let before = f.tok.balance(&f.cid);
+    client.settle_round(&f.id);
+    // Winner still receives a FULL 300 pot: 200 collected + 100 from the reserve.
+    assert_eq!(before - f.tok.balance(&f.cid), 300);
+    let st = client.get_group_state(&f.id);
+    assert_eq!(st.total_uncovered_shortfall, 0);
+    assert_eq!(st.reserve, 1 + 500 - 100);
+
+    // Round 3: last un-won member wins, again a full pot, then the cycle closes.
+    client.contribute(&f.id, &f.ms[1]);
+    client.contribute(&f.id, &f.ms[2]);
+    let _ = client.try_submit_bid(&f.id, &f.ms[1], &0);
+    let _ = client.try_submit_bid(&f.id, &f.ms[2], &0);
+    client.settle_round(&f.id);
+    let st = client.get_group_state(&f.id);
+    assert!(st.completed);
+    assert_eq!(st.total_uncovered_shortfall, 0);
+
+    // Survivors (ms[1], ms[2]) split what's left; ms[0] forfeited everything.
+    assert_eq!(client.try_claim_refund(&f.id, &f.ms[0]), Err(Ok(Error::MemberNotActive)));
+    client.claim_refund(&f.id, &f.ms[1]);
+    client.claim_refund(&f.id, &f.ms[2]);
+    // Whatever remains in the contract is exactly the reserve dust — nothing is stranded.
+    let st = client.get_group_state(&f.id);
+    assert_eq!(f.tok.balance(&f.cid), st.reserve);
+    assert!(st.reserve < 2, "at most sub-member dust may remain");
+}
+
+#[test]
+fn two_defaults_still_pay_full_pots_and_conserve_value_when_collateral_rule_holds() {
+    // 4 members, contribution 100, collateral 300 (= the lock-time minimum, 3*100).
+    // Because collateral >= (n-1)*contribution, a defaulter's own collateral
+    // covers every contribution their seat misses, so no bad debt can arise.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, tok, asset) = setup(&env);
+    let cid = deploy(&env);
+    init_and_approve(&env, &cid, &tok.address);
+    let client = LiholiswanoContractV2Client::new(&env, &cid);
+    let admin = Address::generate(&env);
+    let ms = [Address::generate(&env), Address::generate(&env), Address::generate(&env), Address::generate(&env)];
+    for m in ms.iter() { asset.mint(m, &10_000); }
+    let id = Symbol::new(&env, "grp1");
+    let admins = Vec::from_array(&env, [admin]);
+    client.create_group(&id, &admins, &1, &tok.address, &100, &300, &2000, &10, &(28 * DAY));
+    for m in ms.iter() { client.join_group(&id, m); }
+    client.lock_group(&id, &admins);
+
+    // Round 1: all pay, ms[0] wins (tie on 0% -> lowest index).
+    for m in ms.iter() { client.contribute(&id, m); }
+    for m in ms.iter() { client.submit_bid(&id, m, &0); }
+    client.settle_round(&id);
+
+    // Round 2: ms[0] and ms[1] go silent, ms[2] and ms[3] pay.
+    client.contribute(&id, &ms[2]);
+    client.contribute(&id, &ms[3]);
+    client.submit_bid(&id, &ms[2], &0);
+    client.submit_bid(&id, &ms[3], &0);
+    advance_time(&env, 29 * DAY);
+    let before = tok.balance(&cid);
+    client.settle_round(&id);
+    assert_eq!(before - tok.balance(&cid), 400, "winner still gets a full 400 pot");
+    assert_eq!(client.get_group_state(&id).reserve, 600 - 200);
+
+    // Round 3: the last un-won survivor (ms[3]) wins another full pot; cycle closes.
+    client.contribute(&id, &ms[2]);
+    client.contribute(&id, &ms[3]);
+    let _ = client.try_submit_bid(&id, &ms[2], &0);
+    client.submit_bid(&id, &ms[3], &0);
+    client.settle_round(&id);
+    let st = client.get_group_state(&id);
+    assert!(st.completed);
+    assert_eq!(st.total_uncovered_shortfall, 0);
+    assert_eq!(st.refund_share, 100); // (600 - 200 - 200) / 2 survivors
+
+    client.claim_refund(&id, &ms[2]);
+    client.claim_refund(&id, &ms[3]);
+    assert_eq!(client.try_claim_refund(&id, &ms[1]), Err(Ok(Error::MemberNotActive)));
+    assert_eq!(tok.balance(&cid), client.get_group_state(&id).reserve);
+    assert_eq!(client.get_group_state(&id).reserve, 0);
+}
+
+#[test]
+fn lock_rejects_collateral_that_cannot_cover_a_first_slot_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, tok, asset) = setup(&env);
+    let cid = deploy(&env);
+    init_and_approve(&env, &cid, &tok.address);
+    let client = LiholiswanoContractV2Client::new(&env, &cid);
+    let admin = Address::generate(&env);
+    let ms = [Address::generate(&env), Address::generate(&env), Address::generate(&env)];
+    for m in ms.iter() { asset.mint(m, &10_000); }
+    let id = Symbol::new(&env, "grp1");
+    let admins = Vec::from_array(&env, [admin]);
+    // 3 members * contribution 100 -> a first winner could still owe 200; collateral 150 is too low.
+    client.create_group(&id, &admins, &1, &tok.address, &100, &150, &2000, &10, &(28 * DAY));
+    for m in ms.iter() { client.join_group(&id, m); }
+    assert_eq!(client.try_lock_group(&id, &admins), Err(Ok(Error::CollateralTooLow)));
+}
+
+#[test]
+fn max_members_is_capped() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, tok, _) = setup(&env);
+    let cid = deploy(&env);
+    init_and_approve(&env, &cid, &tok.address);
+    let client = LiholiswanoContractV2Client::new(&env, &cid);
+    let admins = Vec::from_array(&env, [Address::generate(&env)]);
+    let id = Symbol::new(&env, "big");
+    let r = client.try_create_group(&id, &admins, &1, &tok.address, &100, &50_000, &2000, &(MAX_MEMBERS + 1), &(28 * DAY));
+    assert_eq!(r, Err(Ok(Error::InvalidConfig)));
+    client.create_group(&id, &admins, &1, &tok.address, &100, &50_000, &2000, &MAX_MEMBERS, &(28 * DAY));
+}
+
+#[test]
+fn manual_default_of_a_contributed_member_forfeits_instead_of_stranding() {
+    let env = Env::default();
+    let f = fixture(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &f.cid);
+    client.contribute(&f.id, &f.ms[0]);
+    let before_reserve = client.get_group_state(&f.id).reserve;
+    client.mark_default(&f.id, &f.admins, &f.ms[0]);
+    let st = client.get_group_state(&f.id);
+    // 500 collateral + the 100 already contributed this round.
+    assert_eq!(st.reserve - before_reserve, 600);
+    assert_eq!(st.open_slots, 1);
+}
+
+#[test]
+fn last_eligible_member_cannot_bid_away_their_own_pot() {
+    let env = Env::default();
+    let f = fixture(&env);
+    let client = LiholiswanoContractV2Client::new(&env, &f.cid);
+    play_round(&f, [0, 0, 0]);
+    play_round(&f, [0, 0, 0]);
+    // Round 3: only ms[2] can still win. A 20% bid must be neutralised to 0.
+    play_round(&f, [0, 0, 2000]);
+    assert!(client.get_group_state(&f.id).completed);
+    // Each member won one full pot of 300, so nobody received a bid discount share.
+    assert_eq!(client.get_member(&f.id, &f.ms[2]).total_received, 300);
+    assert_eq!(client.get_member(&f.id, &f.ms[0]).total_received, 300);
+    assert_eq!(client.get_member(&f.id, &f.ms[1]).total_received, 300);
 }
