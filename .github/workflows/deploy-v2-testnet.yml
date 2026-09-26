@@ -110,138 +110,191 @@ jobs:
 
 
       # ---------------------------------------------------------
-      # 10. SET UP ADMIN IDENTITY
+      # 10. PREPARE ADMIN SECRET
+      #
+      # If STELLAR_ADMIN_SECRET already exists, use it directly.
+      # Stellar CLI supports a secret key as --source-account.
+      #
+      # On first run, generate a Testnet account and save its secret.
       # ---------------------------------------------------------
-      - name: Set up the admin identity
+      - name: Prepare the Stellar admin secret
         env:
           ADMIN_SECRET: ${{ secrets.STELLAR_ADMIN_SECRET }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_SECRETS }}
 
         run: |
 
+          set -euo pipefail
+
           if [ -n "$ADMIN_SECRET" ]; then
 
-            echo "A saved admin secret exists."
-            echo "Importing the admin identity."
+            echo "A saved Stellar admin secret exists."
+            echo "The saved secret will be used directly for signing."
 
-            # Do not print shell commands containing the secret.
-            set +x
-
-            expect -c '
-              log_user 0
-
-              set secret $env(ADMIN_SECRET)
-
-              spawn stellar keys add admin --secret-key --overwrite
-
-              expect {
-                -re "(?i).*secret.*key.*" {
-                  send -- "$secret\r"
-                }
-
-                -re "(?i).*seed.*phrase.*" {
-                  send -- "$secret\r"
-                }
-
-                timeout {
-                  puts stderr "ERROR: Timed out waiting for Stellar CLI secret prompt."
-                  exit 10
-                }
-
-                eof {
-                  puts stderr "ERROR: Stellar CLI exited before requesting the secret."
-                  exit 11
-                }
-              }
-
-              expect {
-                eof {
-                  set result [wait]
-                  set exit_code [lindex $result 3]
-
-                  if {$exit_code != 0} {
-                    puts stderr "ERROR: Stellar CLI failed while importing admin identity."
-                    exit $exit_code
-                  }
-
-                  exit 0
-                }
-
-                timeout {
-                  puts stderr "ERROR: Timed out waiting for Stellar CLI to finish."
-                  exit 12
-                }
-              }
-            '
-
-            IMPORT_STATUS=$?
+            {
+              echo "STELLAR_ADMIN_SECRET<<EOF"
+              echo "$ADMIN_SECRET"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
 
             unset ADMIN_SECRET
 
-            if [ "$IMPORT_STATUS" -ne 0 ]; then
-              echo "::error::Admin identity import failed."
-              exit "$IMPORT_STATUS"
-            fi
-
-            echo "Admin identity imported successfully."
-
           else
 
-            echo "No saved admin identity was found."
-            echo "Generating a new Stellar Testnet admin identity."
+            echo "No saved Stellar admin secret exists."
+            echo "Generating a new Stellar Testnet admin account."
 
             stellar keys generate admin \
               --network testnet \
               --fund
 
+            GENERATED_SECRET="$(stellar keys secret admin)"
+
+            if [ -z "$GENERATED_SECRET" ]; then
+              echo "::error::Could not retrieve the generated admin secret."
+              exit 1
+            fi
+
+            {
+              echo "STELLAR_ADMIN_SECRET<<EOF"
+              echo "$GENERATED_SECRET"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+
+            if [ -z "${GH_TOKEN:-}" ]; then
+              echo "::error::GH_PAT_FOR_SECRETS is not configured."
+              echo "::error::The new Testnet admin secret cannot be saved automatically."
+              exit 1
+            fi
+
+            echo "Saving the generated admin secret to GitHub Secrets."
+
+            printf '%s' "$GENERATED_SECRET" | \
+              gh secret set STELLAR_ADMIN_SECRET \
+              --repo "${{ github.repository }}"
+
+            echo "Admin secret saved successfully."
+
+            unset GENERATED_SECRET
           fi
 
 
-          # -----------------------------------------------------
-          # PUBLIC KEY IS SAFE TO PRINT
-          # SECRET KEY IS NEVER PRINTED
-          # -----------------------------------------------------
-
-          echo ""
-          echo "Admin public key:"
-          stellar keys address admin
-
-
       # ---------------------------------------------------------
-      # 11. SAVE ADMIN SECRET ON FIRST RUN
+      # 11. DERIVE ADMIN PUBLIC KEY
+      #
+      # The contract needs the public G... address as protocol_admin.
+      #
+      # We use a temporary Stellar CLI config only for this purpose.
+      # The secret is never printed.
       # ---------------------------------------------------------
-      - name: Save the new admin identity as a repo secret (first run only)
-        if: ${{ env.HAS_ADMIN_SECRET == 'false' }}
-
+      - name: Derive admin public key
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_SECRETS }}
+          ADMIN_SECRET: ${{ env.STELLAR_ADMIN_SECRET }}
 
         run: |
 
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::GH_PAT_FOR_SECRETS is not set."
-            echo "::error::The workflow generated an admin identity, but cannot save it automatically."
-            echo "::error::Create the required GitHub token and save it as GH_PAT_FOR_SECRETS."
+          set -euo pipefail
+
+          echo "Deriving the admin public key."
+
+          TEMP_STELLAR_HOME="$(mktemp -d)"
+          export XDG_CONFIG_HOME="$TEMP_STELLAR_HOME"
+
+          # Import only into the temporary config.
+          # log_user 0 prevents the secret/prompt exchange from appearing.
+          expect -c '
+            log_user 0
+
+            set secret $env(ADMIN_SECRET)
+
+            spawn stellar keys add admin --secret-key
+
+            expect {
+              -re "(?i).*secret.*key.*" {
+                send -- "$secret\r"
+              }
+
+              -re "(?i).*seed.*phrase.*" {
+                send -- "$secret\r"
+              }
+
+              timeout {
+                puts stderr "ERROR: Timed out waiting for Stellar CLI secret prompt."
+                exit 20
+              }
+
+              eof {
+                puts stderr "ERROR: Stellar CLI exited before requesting the secret."
+                exit 21
+              }
+            }
+
+            expect {
+              eof {
+                set result [wait]
+                set exit_code [lindex $result 3]
+
+                if {$exit_code != 0} {
+                  puts stderr "ERROR: Temporary Stellar identity import failed."
+                  exit $exit_code
+                }
+
+                exit 0
+              }
+
+              timeout {
+                puts stderr "ERROR: Timed out waiting for Stellar CLI to finish importing the key."
+                exit 22
+              }
+            }
+          '
+
+          ADMIN_PUBLIC_KEY="$(stellar keys public-key admin)"
+
+          if [ -z "$ADMIN_PUBLIC_KEY" ]; then
+            echo "::error::Could not derive the admin public key."
+            rm -rf "$TEMP_STELLAR_HOME"
             exit 1
           fi
 
-          set +x
+          case "$ADMIN_PUBLIC_KEY" in
+            G*)
+              ;;
+            *)
+              echo "::error::Derived admin address is not a Stellar G... public key."
+              rm -rf "$TEMP_STELLAR_HOME"
+              exit 1
+              ;;
+          esac
 
-          stellar keys secret admin | \
-            gh secret set STELLAR_ADMIN_SECRET \
-            --repo "${{ github.repository }}"
+          echo ""
+          echo "Admin public key:"
+          echo "$ADMIN_PUBLIC_KEY"
 
-          echo "Admin secret saved to STELLAR_ADMIN_SECRET."
-          echo "The secret itself was not printed."
+          echo "ADMIN_PUBLIC_KEY=$ADMIN_PUBLIC_KEY" >> "$GITHUB_ENV"
+
+          rm -rf "$TEMP_STELLAR_HOME"
+
+          unset ADMIN_SECRET
 
 
       # ---------------------------------------------------------
       # 12. DEPLOY THE CONTRACT
+      #
+      # IMPORTANT:
+      # Do NOT import the secret into a persistent "admin" identity.
+      # Pass the secret directly to --source-account.
       # ---------------------------------------------------------
       - name: Deploy the contract
         id: deploy
         working-directory: contract-v2
 
+        env:
+          ADMIN_SECRET: ${{ env.STELLAR_ADMIN_SECRET }}
+
         run: |
+
+          set -euo pipefail
 
           WASM_PATH="target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm"
 
@@ -251,16 +304,12 @@ jobs:
             exit 1
           fi
 
-          echo "Deploying this WASM:"
-          echo "$WASM_PATH"
+          echo "Deploying Liholiswano v2."
 
-          echo ""
-          echo "Starting Soroban contract deployment..."
-
-          CONTRACT_ID=$(stellar contract deploy \
+          CONTRACT_ID="$(stellar contract deploy \
             --wasm "$WASM_PATH" \
             --network testnet \
-            --source-account admin)
+            --source-account "$ADMIN_SECRET")"
 
           if [ -z "$CONTRACT_ID" ]; then
             echo "::error::Stellar deployment returned an empty contract ID."
@@ -271,62 +320,77 @@ jobs:
 
           echo ""
           echo "=========================================="
-          echo "Liholiswano v2 CONTRACT DEPLOYED"
+          echo "LIHOLISWANO V2 CONTRACT DEPLOYED"
           echo "=========================================="
           echo ""
           echo "Contract ID:"
           echo "$CONTRACT_ID"
           echo ""
 
+          unset ADMIN_SECRET
+
 
       # ---------------------------------------------------------
       # 13. INITIALIZE CONTRACT
       # ---------------------------------------------------------
       - name: Initialize the contract
+        env:
+          ADMIN_SECRET: ${{ env.STELLAR_ADMIN_SECRET }}
+
         run: |
 
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
-          ADMIN_ADDRESS="$(stellar keys address admin)"
+          set -euo pipefail
 
-          echo "Initializing Liholiswano v2..."
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+
+          echo "Initializing Liholiswano v2."
+
+          echo ""
           echo "Contract:"
           echo "$CONTRACT_ID"
 
           echo ""
           echo "Protocol admin:"
-          echo "$ADMIN_ADDRESS"
+          echo "$ADMIN_PUBLIC_KEY"
 
           stellar contract invoke \
             --id "$CONTRACT_ID" \
-            --source-account admin \
+            --source-account "$ADMIN_SECRET" \
             --network testnet \
             -- initialize \
-            --protocol_admin "$ADMIN_ADDRESS"
+            --protocol_admin "$ADMIN_PUBLIC_KEY"
 
           echo ""
           echo "Contract initialization completed."
+
+          unset ADMIN_SECRET
 
 
       # ---------------------------------------------------------
       # 14. DEPLOY / LOCATE TESTNET USDC SAC
       # ---------------------------------------------------------
       - name: Make sure Testnet USDC has a token contract
+        env:
+          ADMIN_SECRET: ${{ env.STELLAR_ADMIN_SECRET }}
+
         run: |
 
-          echo "Checking Testnet USDC Stellar Asset Contract..."
+          set -euo pipefail
+
+          echo "Checking Testnet USDC Stellar Asset Contract."
 
           stellar contract asset deploy \
             --asset "USDC:${USDC_TESTNET_ISSUER}" \
-            --source-account admin \
+            --source-account "$ADMIN_SECRET" \
             --network testnet \
-            || echo "USDC SAC deployment reported an error."
-            
-          echo ""
-          echo "Resolving Testnet USDC SAC address..."
+            || echo "USDC SAC deployment reported an error; continuing to resolve the SAC."
 
-          USDC_SAC=$(stellar contract id asset \
+          echo ""
+          echo "Resolving Testnet USDC SAC address."
+
+          USDC_SAC="$(stellar contract id asset \
             --asset "USDC:${USDC_TESTNET_ISSUER}" \
-            --network testnet)
+            --network testnet)"
 
           if [ -z "$USDC_SAC" ]; then
             echo "::error::Could not resolve the Testnet USDC SAC contract ID."
@@ -339,15 +403,21 @@ jobs:
 
           echo "USDC_SAC=$USDC_SAC" >> "$GITHUB_ENV"
 
+          unset ADMIN_SECRET
+
 
       # ---------------------------------------------------------
       # 15. APPROVE TESTNET USDC
       # ---------------------------------------------------------
       - name: Approve Testnet USDC
+        env:
+          ADMIN_SECRET: ${{ env.STELLAR_ADMIN_SECRET }}
+
         run: |
 
+          set -euo pipefail
+
           CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
-          ADMIN_ADDRESS="$(stellar keys address admin)"
 
           echo "Approving Testnet USDC for Liholiswano v2."
 
@@ -357,7 +427,7 @@ jobs:
 
           echo ""
           echo "Admin:"
-          echo "$ADMIN_ADDRESS"
+          echo "$ADMIN_PUBLIC_KEY"
 
           echo ""
           echo "Token:"
@@ -365,34 +435,43 @@ jobs:
 
           stellar contract invoke \
             --id "$CONTRACT_ID" \
-            --source-account admin \
+            --source-account "$ADMIN_SECRET" \
             --network testnet \
             -- add_approved_token \
-            --protocol_admin "$ADMIN_ADDRESS" \
+            --protocol_admin "$ADMIN_PUBLIC_KEY" \
             --token "$USDC_SAC"
 
           echo ""
           echo "Testnet USDC approval completed."
+
+          unset ADMIN_SECRET
 
 
       # ---------------------------------------------------------
       # 16. READ APPROVED TOKENS
       # ---------------------------------------------------------
       - name: Verify approved tokens
+        env:
+          ADMIN_SECRET: ${{ env.STELLAR_ADMIN_SECRET }}
+
         run: |
+
+          set -euo pipefail
 
           CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
 
-          echo "Reading approved tokens from the deployed contract..."
+          echo "Reading approved tokens from the deployed contract."
 
           stellar contract invoke \
             --id "$CONTRACT_ID" \
-            --source-account admin \
+            --source-account "$ADMIN_SECRET" \
             --network testnet \
             -- list_approved_tokens
 
           echo ""
           echo "Approved-token verification completed."
+
+          unset ADMIN_SECRET
 
 
       # ---------------------------------------------------------
