@@ -10,3 +10,39 @@ create table if not exists notifications(id uuid primary key default gen_random_
 create table if not exists audit_log(id bigserial primary key,user_id uuid references users(id),action text not null,ip inet,metadata jsonb not null default '{}'::jsonb,created_at timestamptz not null default now());
 create index if not exists tx_user_created on transactions(user_id,created_at desc);
 create index if not exists audit_created on audit_log(created_at desc);
+
+alter table users add column if not exists email_verified boolean not null default false;
+alter table users add column if not exists phone text;
+alter table users add column if not exists phone_verified boolean not null default false;
+alter table users drop constraint if exists users_kyc_status_check;
+alter table users add constraint users_kyc_status_check check(kyc_status in ('pending','in_progress','verified','rejected','review'));
+
+create table if not exists kyc_sessions(
+ id uuid primary key default gen_random_uuid(),
+ user_id uuid not null references users(id) on delete cascade,
+ provider text not null,
+ provider_session_id text,
+ reference text unique not null,
+ status text not null default 'pending',
+ document_type text,
+ document_verified boolean not null default false,
+ face_verified boolean not null default false,
+ liveness_verified boolean not null default false,
+ aml_screened boolean not null default false,
+ pep_screened boolean not null default false,
+ duplicate_face_checked boolean not null default false,
+ result jsonb not null default '{}'::jsonb,
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+create table if not exists kyc_events(
+ id bigserial primary key,
+ session_id uuid references kyc_sessions(id) on delete cascade,
+ user_id uuid references users(id) on delete cascade,
+ event_type text not null,
+ provider_event_id text unique,
+ payload jsonb not null default '{}'::jsonb,
+ created_at timestamptz not null default now()
+);
+create index if not exists kyc_sessions_user on kyc_sessions(user_id,created_at desc);
+create index if not exists kyc_events_session on kyc_events(session_id,created_at desc);
