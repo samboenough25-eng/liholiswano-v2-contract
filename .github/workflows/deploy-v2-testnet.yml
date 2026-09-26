@@ -481,7 +481,7 @@ jobs:
         run: |
 
           CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
-          ADMIN_ADDRESS="$(stellar keys address admin)"
+          ADMIN_ADDRESS="$ADMIN_PUBLIC_KEY"
 
           {
             echo "### Liholiswano v2 — Stellar Testnet Deployment"
