@@ -2,8 +2,7 @@ name: Testnet - initialize + live test cycle (existing contract)
 
 # Continues from the deployed contract. Uses your saved STELLAR_ADMIN_SECRET
 # (the deployer) as protocol admin + group admin, and throwaway accounts for
-# everything else. Works against the v2.1 contract you deployed AND against
-# v2.2 later - the last step tells you which one you have.
+# everything else. This workflow is for the current deployed v2.2 contract.
 
 on:
   workflow_dispatch:
@@ -11,7 +10,7 @@ on:
       contract_id:
         description: "Deployed Liholiswano contract ID"
         required: true
-        default: "CBJ7CJWU7PSVLZOSDPCZTKY6BLIVAO6DRFVSKX25WOIRFTUJDV3M5OJY"
+        default: "CAGSH4W3EJYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY"
 
 jobs:
   cycle:
@@ -129,9 +128,9 @@ jobs:
             echo "- Refunds claimed: **$CLAIMED of 3**"
             echo "- Token still held by the contract: **$LEFT** (base units; 3 members x 3000000 collateral = 9000000 if none returned)"
             if [ "$CLAIMED" -eq 0 ]; then
-              echo "- Result: this is the **v2.1** contract - collateral is stuck. Deploy v2.2 to fix."
+              echo "- Result: the deployed contract did not complete the refund test. Stop and investigate before using it."
             else
-              echo "- Result: this is **v2.2** - refunds work."
+              echo "- Result: refund path passed for the deployed contract."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY" | tail -8
