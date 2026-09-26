@@ -46,3 +46,14 @@ create table if not exists kyc_events(
 );
 create index if not exists kyc_sessions_user on kyc_sessions(user_id,created_at desc);
 create index if not exists kyc_events_session on kyc_events(session_id,created_at desc);
+
+create table if not exists verification_tokens(
+ id uuid primary key default gen_random_uuid(),
+ user_id uuid not null references users(id) on delete cascade,
+ channel text not null check(channel in ('email','phone')),
+ token_hash text not null,
+ expires_at timestamptz not null,
+ used_at timestamptz,
+ created_at timestamptz not null default now()
+);
+create index if not exists verification_tokens_user on verification_tokens(user_id,channel,created_at desc);
