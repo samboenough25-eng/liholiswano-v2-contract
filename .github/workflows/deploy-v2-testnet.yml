@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
 
+# [deploy-testnet] redeploy after resilient config publishing fix
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
