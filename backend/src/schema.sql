@@ -70,3 +70,47 @@ create table if not exists password_reset_tokens(
 create index if not exists password_reset_tokens_user on password_reset_tokens(user_id,created_at desc);
 
 create unique index if not exists transactions_stellar_hash_unique on transactions(stellar_hash) where stellar_hash is not null;
+
+
+create table if not exists supported_assets(
+ id uuid primary key default gen_random_uuid(),
+ symbol text not null,
+ issuer text,
+ network text not null,
+ decimals integer not null default 7 check(decimals between 0 and 18),
+ contract_address text,
+ status text not null default 'active' check(status in ('active','disabled')),
+ created_at timestamptz not null default now(),
+ unique(symbol,network,issuer)
+);
+create table if not exists treasury_accounts(
+ id uuid primary key default gen_random_uuid(),
+ network text not null unique,
+ public_key text not null,
+ status text not null default 'active' check(status in ('active','disabled')),
+ created_at timestamptz not null default now()
+);
+create table if not exists funding_orders(
+ id uuid primary key default gen_random_uuid(),
+ user_id uuid not null references users(id),
+ treasury_account_id uuid references treasury_accounts(id),
+ asset_id uuid references supported_assets(id),
+ amount numeric(30,7) not null check(amount > 0),
+ stellar_hash text unique,
+ status text not null default 'pending' check(status in ('pending','submitted','confirmed','failed','reversed')),
+ idempotency_key text unique,
+ metadata jsonb not null default '{}'::jsonb,
+ created_at timestamptz not null default now(),
+ confirmed_at timestamptz
+);
+create table if not exists wallet_challenges(
+ id uuid primary key default gen_random_uuid(),
+ user_id uuid not null references users(id) on delete cascade,
+ wallet_id uuid references wallets(id) on delete cascade,
+ challenge text not null,
+ expires_at timestamptz not null,
+ used_at timestamptz,
+ created_at timestamptz not null default now()
+);
+create index if not exists funding_user_created on funding_orders(user_id,created_at desc);
+create index if not exists wallet_challenges_user on wallet_challenges(user_id,created_at desc);
