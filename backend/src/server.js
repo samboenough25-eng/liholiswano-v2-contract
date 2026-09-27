@@ -21,6 +21,20 @@ const auth=(req,res,next)=>{try{const h=req.headers.authorization||'';if(!h.star
 const role=(...roles)=>(req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:'Insufficient permission'});
 const audit=async(req,action,metadata={})=>{try{await pool.query('insert into audit_log(user_id,action,ip,metadata) values($1,$2,$3,$4)',[req.user?.sub||null,action,req.ip,metadata])}catch{}};
 const kycVerified=async(req,res,next)=>{const r=await pool.query('select kyc_status from users where id=$1',[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:'User not found'});if(r.rows[0].kyc_status!=='verified')return res.status(403).json({error:'KYC verification is required before this financial operation',kyc_status:r.rows[0].kyc_status});next()};
+const hashToken=v=>crypto.createHash('sha256').update(v).digest('hex');
+const makeCode=()=>String(crypto.randomInt(100000,1000000));
+const sendVerificationEmail=async(to,code)=>{
+ const key=process.env.RESEND_API_KEY;
+ const from=process.env.EMAIL_FROM;
+ if(!key||!from){
+   if(process.env.NODE_ENV==='production')throw new Error('Email provider is not configured');
+   console.log(`DEV EMAIL VERIFICATION for ${to}: ${code}`);
+   return {delivered:false,development:true};
+ }
+ const r=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({from,to,subject:'Verify your Liholiswano email',text:`Your Liholiswano verification code is ${code}. It expires in 15 minutes.`})});
+ if(!r.ok)throw new Error('Email delivery failed');
+ return {delivered:true};
+};
 
 app.get('/health',async(_,res)=>{try{await pool.query('select 1');res.json({ok:true,service:'liholiswano-api',network:process.env.STELLAR_NETWORK||'testnet'})}catch{res.status(503).json({ok:false})}});
 
@@ -28,16 +42,48 @@ app.post('/api/auth/register',async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string().min(12),fullName:z.string().min(2).max(120),country:z.enum(['BW','SZ'])}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid registration data'});
  const x=p.data;
- try{const hash=await bcrypt.hash(x.password,12);const r=await pool.query('insert into users(email,password_hash,full_name,country,email_verified) values($1,$2,$3,$4,false) returning id,email,full_name,country,role,kyc_status,email_verified',[x.email.toLowerCase(),hash,x.fullName,x.country]);res.status(201).json({user:r.rows[0],token:sign(r.rows[0]),message:'Account created. Email verification is the next required step.'})}
+ try{const hash=await bcrypt.hash(x.password,12);const r=await pool.query('insert into users(email,password_hash,full_name,country,email_verified) values($1,$2,$3,$4,false) returning id,email,full_name,country,role,kyc_status,email_verified',[x.email.toLowerCase(),hash,x.fullName,x.country]);const code=makeCode();
+   await pool.query("insert into verification_tokens(user_id,channel,token_hash,expires_at) values($1,'email',$2,now()+interval '15 minutes')",[r.rows[0].id,hashToken(code)]);
+   const delivery=await sendVerificationEmail(r.rows[0].email,code);
+   res.status(201).json({user:r.rows[0],token:sign(r.rows[0]),email_verification_required:true,development_code:delivery.development?code:undefined,message:'Account created. Verify your email before using financial features.'})}
  catch{res.status(409).json({error:'Email is already registered'})}
 });
 
+app.post('/api/auth/resend-verification',auth,async(req,res)=>{
+ const r=await pool.query('select id,email,email_verified from users where id=$1',[req.user.sub]);
+ if(!r.rowCount)return res.status(404).json({error:'User not found'});
+ if(r.rows[0].email_verified)return res.json({verified:true,message:'Email is already verified'});
+ await pool.query("update verification_tokens set used_at=now() where user_id=$1 and channel='email' and used_at is null",[req.user.sub]);
+ const code=makeCode();
+ await pool.query("insert into verification_tokens(user_id,channel,token_hash,expires_at) values($1,'email',$2,now()+interval '15 minutes')",[req.user.sub,hashToken(code)]);
+ try{
+   const delivery=await sendVerificationEmail(r.rows[0].email,code);
+   res.json({verified:false,development_code:delivery.development?code:undefined,message:'A new verification code was sent.'});
+ }catch(e){res.status(503).json({error:'Email delivery is not configured yet'});}
+});
+app.post('/api/auth/verify-email',async(req,res)=>{
+ const p=z.object({email:z.string().email(),code:z.string().regex(/^\d{6}$/)}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Enter a valid email and 6-digit code'});
+ const u=await pool.query('select id,email,email_verified from users where email=$1',[p.data.email.toLowerCase()]);
+ if(!u.rowCount)return res.status(400).json({error:'Invalid verification code'});
+ if(u.rows[0].email_verified)return res.json({verified:true,message:'Email is already verified'});
+ const t=await pool.query("select id from verification_tokens where user_id=$1 and channel='email' and token_hash=$2 and used_at is null and expires_at>now() order by created_at desc limit 1",[u.rows[0].id,hashToken(p.data.code)]);
+ if(!t.rowCount)return res.status(400).json({error:'Invalid or expired verification code'});
+ await pool.query('begin');
+ try{
+   await pool.query('update verification_tokens set used_at=now() where id=$1',[t.rows[0].id]);
+   await pool.query('update users set email_verified=true,updated_at=now() where id=$1',[u.rows[0].id]);
+   await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.email.verified',{}]);
+   await pool.query('commit');
+ }catch(e){await pool.query('rollback');throw e}
+ res.json({verified:true,message:'Email verified successfully. You can now sign in.'});
+});
 app.post('/api/auth/login',async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string()}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid login'});
  const r=await pool.query('select * from users where email=$1',[p.data.email.toLowerCase()]);
  if(!r.rowCount||!(await bcrypt.compare(p.data.password,r.rows[0].password_hash)))return res.status(401).json({error:'Invalid email or password'});
- const u=r.rows[0];delete u.password_hash;res.json({user:u,token:sign(u),portal:['owner','admin'].includes(u.role)?'owner':u.role==='compliance'?'compliance':'customer'});
+ const u=r.rows[0];delete u.password_hash;res.json({user:u,token:sign(u),portal:['owner','admin'].includes(u.role)?'owner':u.role==='compliance'?'compliance':'customer',email_verification_required:u.email_verified===false});
 });
 
 app.get('/api/me',auth,async(req,res)=>{const r=await pool.query('select id,email,full_name,country,role,kyc_status,kyc_reference,created_at from users where id=$1',[req.user.sub]);res.json(r.rows[0]||null)});
