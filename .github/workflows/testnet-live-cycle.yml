@@ -19,7 +19,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[run-live-cycle]')
     runs-on: ubuntu-latest
     env:
-      CID: ${{ inputs.contract_id }}
+      CID: ${{ inputs.contract_id || 'CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY' }}
       NET: testnet
     steps:
       - name: Install system libraries the Stellar CLI needs
@@ -71,10 +71,19 @@ jobs:
           done
           echo "Test token contract: $TOKEN"
 
-      - name: Approve the test token on the contract
+      - name: Verify deployed contract and approve the test token
         run: |
+          set -euo pipefail
+          ADMIN="$(stellar keys address admin)"
+          echo "Contract: $CID"
+          echo "Protocol admin: $ADMIN"
+          echo "Test token: $TOKEN"
+          echo "Current approved tokens:"
+          stellar contract invoke --id "$CID" --source-account admin --network $NET -- list_approved_tokens
+          echo "Adding test token to allowlist..."
           stellar contract invoke --id "$CID" --source-account admin --network $NET \
-            -- add_approved_token --protocol_admin "$(stellar keys address admin)" --token "$TOKEN"
+            -- add_approved_token --protocol_admin "$ADMIN" --token "$TOKEN"
+          echo "Approved tokens after update:"
           stellar contract invoke --id "$CID" --source-account admin --network $NET -- list_approved_tokens
 
       - name: Create group, join, lock
