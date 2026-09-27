@@ -16,7 +16,7 @@ on:
 
 jobs:
   cycle:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[run-live-cycle]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[run-live-cycle]') || contains(github.event.head_commit.message, 'live cycle')
     runs-on: ubuntu-latest
     env:
       CID: ${{ inputs.contract_id || 'CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY' }}
