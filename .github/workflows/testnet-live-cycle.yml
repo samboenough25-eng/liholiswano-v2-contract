@@ -10,7 +10,7 @@ on:
       contract_id:
         description: "Deployed Liholiswano contract ID"
         required: true
-        default: "CAGSH4W3EJYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY"
+        default: "CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY"
 
 jobs:
   cycle:
