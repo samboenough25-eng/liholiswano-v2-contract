@@ -16,7 +16,7 @@ body{font-family:system-ui;margin:0;background:#f4f7f6;color:#14201b}header{back
 <pre id="fundResult">No funding order yet.</pre>
 <h3>Pending / recent funding orders</h3><pre id="fundOrders">Loading...</pre>
 <p class="muted">After sending the payment from the treasury wallet to the customer's wallet, paste the Stellar transaction hash below.</p>
-<input id="confirmId" placeholder="Funding order ID"><input id="confirmHash" placeholder="64-character Stellar transaction hash"><button onclick="confirmFunding()">Confirm funding transaction</button>
+<input id="confirmId" placeholder="Funding order ID"><input id="confirmHash" placeholder="64-character Stellar transaction hash"><button onclick="payFunding()">Pay selected order with Freighter</button><button onclick="confirmFunding()">Confirm funding transaction</button>
 </section>
 <section id="kyc" class="hidden"><h2>KYC Queue</h2><pre id="kycout">Loading...</pre></section>
 <section id="tx" class="hidden"><h2>Blockchain Transactions</h2><pre id="txout">Loading...</pre></section>
@@ -46,6 +46,25 @@ function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt
 window.saveTreasury=async()=>{try{const j=await api('/admin/treasury',{method:'PUT',body:JSON.stringify({network:'testnet',publicKey:$('treasury').value.trim(),status:'active'})});$('treasuryResult').textContent=JSON.stringify(j,null,2)}catch(e){$('treasuryResult').textContent=e.message}}
 window.setupTestnetUsdc=async()=>{try{const j=await api('/admin/assets',{method:'POST',body:JSON.stringify({symbol:'USDC',issuer:'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',network:'testnet',decimals:7,contractAddress:'CAC2XTKZ527GSTTCVJWZNBDJLEDLNFCASGZ2CNQH6V3UCZYAGE5QASOU',status:'active'})});$('assetResult').textContent=JSON.stringify(j,null,2);await loadAssets()}catch(e){$('assetResult').textContent=e.message}}
 window.createFunding=async()=>{try{const j=await api('/admin/funding-orders',{method:'POST',body:JSON.stringify({userId:$('fundUser').value.trim(),assetId:$('fundAsset').value,amount:Number($('fundAmount').value),idempotencyKey:$('fundKey').value.trim()})});$('fundResult').textContent=JSON.stringify(j,null,2);await loadFunding()}catch(e){$('fundResult').textContent=e.message}}
+window.payFunding=async()=>{try{
+ const id=$('confirmId').value.trim(); if(!id)throw Error('Enter a funding order ID');
+ const o=await api('/admin/funding-orders/'+encodeURIComponent(id));
+ if(o.status==='confirmed')throw Error('Funding order is already confirmed');
+ if(o.network!=='testnet')throw Error('Wallet payment helper is currently Testnet-only');
+ if(!o.issuer)throw Error('This asset is not configured as a classic Stellar asset');
+ const a=await connect(); if(a!==o.treasury_public_key)throw Error('Connected Freighter wallet does not match the configured treasury wallet');
+ const horizon=new StellarSdk.Horizon.Server('https://horizon-testnet.stellar.org');
+ const acct=await horizon.loadAccount(a);
+ const asset=new StellarSdk.Asset(o.symbol,o.issuer);
+ const tx=new StellarSdk.TransactionBuilder(acct,{fee:StellarSdk.BASE_FEE,networkPassphrase:StellarSdk.Networks.TESTNET})
+   .addOperation(StellarSdk.Operation.payment({destination:o.recipient_public_key,asset,amount:Number(o.amount).toFixed(Math.min(7,Number(o.decimals||7)))}))
+   .setTimeout(60).build();
+ const signed=await signTransaction(tx.toXDR(),{networkPassphrase:StellarSdk.Networks.TESTNET,address:a});
+ if(!signed?.signedTxXdr)throw Error(signed?.error||'Signing cancelled');
+ const submitted=await horizon.submitTransaction(StellarSdk.TransactionBuilder.fromXDR(signed.signedTxXdr,StellarSdk.Networks.TESTNET));
+ $('confirmHash').value=submitted.hash;
+ $('fundResult').textContent='Payment submitted. Transaction: '+submitted.hash+'\\nClick Confirm funding transaction.';
+ }catch(e){$('fundResult').textContent=e.message}};
 window.confirmFunding=async()=>{try{const j=await api('/admin/funding-orders/'+encodeURIComponent($('confirmId').value.trim())+'/confirm',{method:'POST',body:JSON.stringify({stellarHash:$('confirmHash').value.trim()})});$('fundResult').textContent=JSON.stringify(j,null,2);await loadFunding()}catch(e){$('fundResult').textContent=e.message}}
 async function loadTx(){try{$('txout').textContent=JSON.stringify(await api('/admin/transactions'),null,2)}catch(e){$('txout').textContent=e.message}}async function loadAudit(){try{$('auditout').textContent=JSON.stringify(await api('/admin/audit'),null,2)}catch(e){$('auditout').textContent=e.message}}
 window.show=id=>{['overview','groups','customers','kyc','tx','audit'].forEach(x=>$(x).classList.add('hidden'));$(id).classList.remove('hidden');({overview:loadStats,customers:loadUsers,kyc:loadKyc,tx:loadTx,audit:loadAudit})[id]?.()};
