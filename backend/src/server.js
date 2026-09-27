@@ -106,8 +106,24 @@ app.get('/api/kyc/status',auth,verifiedAccount,async(req,res)=>{
 });
 
 app.get('/api/transactions',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
+app.post('/api/transactions',auth,verifiedAccount,kycVerified,async(req,res)=>{
+ const p=z.object({groupId:z.string().min(1).max(32).optional(),type:z.enum(['join','contribute','bid','settle','refund','default','create_group','lock_group']),asset:z.string().max(80).optional(),amount:z.number().finite().nonnegative().optional(),stellarHash:z.string().regex(/^[a-f0-9]{64}$/i),status:z.enum(['pending','confirmed','failed']).default('confirmed'),metadata:z.record(z.any()).default({})}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid transaction record'});
+ const r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,p.data.status,p.data.metadata]);
+ await audit(req,'transaction.recorded',{type:p.data.type,stellar_hash:p.data.stellarHash,group_id:p.data.groupId||null});
+ res.status(201).json(r.rows[0]);
+});
+
 app.get('/api/notifications',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select * from notifications where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
 app.get('/api/groups',auth,verifiedAccount,async(req,res)=>{const r=await pool.query(`select g.id,g.contract_id,g.status,g.created_at,m.status as membership_status,m.joined_at from groups g join memberships m on m.group_id=g.id where m.user_id=$1 order by g.created_at desc`,[req.user.sub]);res.json(r.rows)});
+app.post('/api/groups/register',auth,verifiedAccount,role('owner','admin'),async(req,res)=>{
+ const p=z.object({id:z.string().min(1).max(32).regex(/^[A-Za-z0-9_]+$/),contractId:z.string().regex(/^C[A-Z2-7]{55}$/),status:z.enum(['open','locked','completed']).default('open')}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid group registration'});
+ const r=await pool.query('insert into groups(id,contract_id,admin_user_id,status) values($1,$2,$3,$4) on conflict(id) do update set contract_id=excluded.contract_id,status=excluded.status returning *',[p.data.id,p.data.contractId,req.user.sub,p.data.status]);
+ await audit(req,'group.registered',{group_id:p.data.id,contract_id:p.data.contractId});
+ res.status(201).json(r.rows[0]);
+});
+
 app.post('/api/wallets',auth,verifiedAccount,kycVerified,async(req,res)=>{const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().min(50).max(60)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid wallet'});const r=await pool.query('insert into wallets(user_id,network,public_key) values($1,$2,$3) on conflict(user_id,network) do update set public_key=excluded.public_key returning id,network,public_key',[req.user.sub,p.data.network,p.data.publicKey]);await audit(req,'wallet.linked',{network:p.data.network});res.status(201).json(r.rows[0])});
 
 app.get('/api/admin/stats',auth,role('owner','admin'),async(_,res)=>{
