@@ -59,7 +59,7 @@ button:disabled{opacity:.5;cursor:wait}
 <section>
   <h2>3. Your group</h2>
   <label for="cid">Contract ID</label>
-  <input id="cid" value="CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY">
+  <input id="cid" value="" id="cid">
   <label for="gid">Group ID</label><input id="gid" placeholder="e.g. t36044013610">
   <div class="row"><button id="load">Load group</button></div>
   <div id="state" class="grid"></div>
@@ -95,7 +95,7 @@ button:disabled{opacity:.5;cursor:wait}
 <section><h2>Activity</h2><div id="log">Ready.</div></section>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@12.3.0/dist/stellar-sdk.min.js"></script>
+<script src="testnet-config.js"></script><script src="https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@12.3.0/dist/stellar-sdk.min.js"></script>
 <script>
 const S = window.StellarSdk;
 const RPC_URL = 'https://soroban-testnet.stellar.org';
@@ -104,6 +104,9 @@ const PASS = S.Networks.TESTNET;
 const rpc = new S.SorobanRpc.Server(RPC_URL);
 const horizon = new S.Horizon.Server(HORIZON_URL);
 let kp = null; // held in memory only; never saved
+$('cid').value = LIVE.contractId || '';
+$('aiss').value = LIVE.usdcIssuer || $('aiss').value;
+$('tok').value = LIVE.usdcSac || $('tok').value;
 
 const $ = id => document.getElementById(id);
 const log = (m, cls) => { const d = $('log'); d.innerHTML += '\n<span class="' + (cls || '') + '">' + String(m).replace(/</g, '&lt;') + '</span>'; d.scrollTop = d.scrollHeight; };
