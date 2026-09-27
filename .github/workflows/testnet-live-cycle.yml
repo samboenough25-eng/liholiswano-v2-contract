@@ -27,11 +27,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/stellar
-          key: stellar-cli-${{ runner.os }}-23.0.1
+          key: stellar-cli-${{ runner.os }}-27.0.0
 
       - name: Install the Stellar CLI (skipped on cache hit)
         if: steps.cli-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked stellar-cli --version 23.0.1
+        run: cargo install --locked stellar-cli --version 27.0.0
 
       - name: Load the admin identity (same secret the deploy used)
         env:
