@@ -1,1 +1,1 @@
-Temporary trigger marker. Test latest full app on Testnet.
+Final Testnet verification trigger for the current MVP.
