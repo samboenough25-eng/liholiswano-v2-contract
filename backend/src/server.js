@@ -80,6 +80,33 @@ app.post('/api/auth/verify-email',async(req,res)=>{
  await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.email.verified',{}]);
  res.json({verified:true,message:'Email verified successfully. You can now sign in.'});
 });
+app.post('/api/auth/forgot-password',async(req,res)=>{
+ const p=z.object({email:z.string().email()}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Enter a valid email'});
+ const r=await pool.query('select id,email from users where email=$1',[p.data.email.toLowerCase()]);
+ if(!r.rowCount)return res.json({message:'If that email exists, a reset message will be sent.'});
+ const raw=crypto.randomBytes(32).toString('hex');
+ await pool.query("update password_reset_tokens set used_at=now() where user_id=$1 and used_at is null",[r.rows[0].id]);
+ await pool.query("insert into password_reset_tokens(user_id,token_hash,expires_at) values($1,$2,now()+interval '30 minutes')",[r.rows[0].id,hashToken(raw)]);
+ const key=process.env.RESEND_API_KEY,from=process.env.EMAIL_FROM;
+ if(!key||!from)return res.status(503).json({error:'Password recovery email is not configured yet'});
+ const rr=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({from,to:r.rows[0].email,subject:'Reset your Liholiswano password',text:'Use this password reset token within 30 minutes: '+raw})});
+ if(!rr.ok)return res.status(503).json({error:'Password recovery email could not be sent'});
+ res.json({message:'If that email exists, a reset message will be sent.'});
+});
+app.post('/api/auth/reset-password',async(req,res)=>{
+ const p=z.object({email:z.string().email(),token:z.string().min(40).max(100),password:z.string().min(12)}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid password reset request'});
+ const u=await pool.query('select id from users where email=$1',[p.data.email.toLowerCase()]);
+ if(!u.rowCount)return res.status(400).json({error:'Invalid or expired reset token'});
+ const t=await pool.query("select id from password_reset_tokens where user_id=$1 and token_hash=$2 and used_at is null and expires_at>now() order by created_at desc limit 1",[u.rows[0].id,hashToken(p.data.token)]);
+ if(!t.rowCount)return res.status(400).json({error:'Invalid or expired reset token'});
+ const hash=await bcrypt.hash(p.data.password,12);
+ await pool.query('update users set password_hash=$1,updated_at=now() where id=$2',[hash,u.rows[0].id]);
+ await pool.query('update password_reset_tokens set used_at=now() where user_id=$1 and used_at is null',[u.rows[0].id]);
+ await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.password.reset',{}]);
+ res.json({message:'Password reset successfully. Please sign in again.'});
+});
 app.post('/api/auth/login',async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string()}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid login'});
