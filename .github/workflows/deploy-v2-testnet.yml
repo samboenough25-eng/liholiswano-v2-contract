@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   deploy:
+    outputs:
+      contract_id: ${{ steps.deploy.outputs.contract_id }}
     runs-on: ubuntu-latest
 
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[deploy-testnet]')
@@ -556,3 +558,11 @@ jobs:
           echo "USDC SAC:"
           echo "$USDC_SAC"
           echo ""
+
+  live-cycle:
+    name: Run live Testnet cycle
+    needs: deploy
+    uses: ./.github/workflows/testnet-live-cycle.yml
+    with:
+      contract_id: ${{ needs.deploy.outputs.contract_id }}
+    secrets: inherit
