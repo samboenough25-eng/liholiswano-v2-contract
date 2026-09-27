@@ -28,7 +28,7 @@ app.post('/api/auth/register',async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string().min(12),fullName:z.string().min(2).max(120),country:z.enum(['BW','SZ'])}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid registration data'});
  const x=p.data;
- try{const hash=await bcrypt.hash(x.password,12);const r=await pool.query('insert into users(email,password_hash,full_name,country) values($1,$2,$3,$4) returning id,email,full_name,country,role,kyc_status',[x.email.toLowerCase(),hash,x.fullName,x.country]);res.status(201).json({user:r.rows[0],token:sign(r.rows[0])})}
+ try{const hash=await bcrypt.hash(x.password,12);const r=await pool.query('insert into users(email,password_hash,full_name,country,email_verified) values($1,$2,$3,$4,false) returning id,email,full_name,country,role,kyc_status,email_verified',[x.email.toLowerCase(),hash,x.fullName,x.country]);res.status(201).json({user:r.rows[0],token:sign(r.rows[0]),message:'Account created. Email verification is the next required step.'})}
  catch{res.status(409).json({error:'Email is already registered'})}
 });
 
