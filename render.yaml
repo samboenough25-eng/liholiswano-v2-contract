@@ -34,7 +34,23 @@ services:
       - key: PAYMENT_PROVIDER
         value: stellar
       - key: RECONCILE_SECRET
-        sync: false
+        generateValue: true
+
+  - type: cron
+    name: liholiswano-reconciliation
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: main
+    buildCommand: npm install
+    startCommand: node -e "fetch('https://liholiswano-api.onrender.com/internal/reconcile',{method:'POST',headers:{'x-reconcile-secret':process.env.RECONCILE_SECRET}}).then(async r=>{console.log(await r.text());if(!r.ok)process.exit(1)}).catch(e=>{console.error(e);process.exit(1)})"
+    schedule: "*/15 * * * *"
+    envVars:
+      - key: RECONCILE_SECRET
+        fromService:
+          name: liholiswano-api
+          type: web
+          envVarKey: RECONCILE_SECRET
 
 databases:
   - name: liholiswano-db
