@@ -5,6 +5,8 @@ name: Testnet - initialize + live test cycle (existing contract)
 # everything else. This workflow is for the current deployed v2.2 contract.
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       contract_id:
@@ -14,6 +16,7 @@ on:
 
 jobs:
   cycle:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[run-live-cycle]')
     runs-on: ubuntu-latest
     env:
       CID: ${{ inputs.contract_id }}
