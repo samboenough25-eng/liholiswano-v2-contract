@@ -328,6 +328,26 @@ app.get('/api/admin/funding-orders/:id',auth,role('owner','admin'),async(req,res
  res.json(r.rows[0]);
 });
 
+async function verifyClassicStellarPayment(hash,expected){
+ const horizonUrl=expected.network==='mainnet'?'https://horizon.stellar.org':'https://horizon-testnet.stellar.org';
+ const tr=await fetch(horizonUrl+'/transactions/'+encodeURIComponent(hash));
+ if(tr.status===404) return {ok:false,error:'Transaction not found on Stellar'};
+ if(!tr.ok) throw new Error('Horizon transaction lookup failed: HTTP '+tr.status);
+ const tx=await tr.json();
+ if(!tx.successful) return {ok:false,error:'Transaction is not successful'};
+ const or=await fetch(horizonUrl+'/transactions/'+encodeURIComponent(hash)+'/operations?limit=200');
+ if(!or.ok) throw new Error('Horizon operation lookup failed: HTTP '+or.status);
+ const ops=(await or.json())._embedded?.records||[];
+ const amount=Number(expected.amount);
+ const match=ops.find(o=>{
+   if(o.type!=='payment') return false;
+   if(o.from!==expected.treasury_public_key || o.to!==expected.recipient_public_key) return false;
+   const assetOk=o.asset_code===expected.symbol && o.asset_issuer===expected.issuer;
+   return assetOk && Math.abs(Number(o.amount)-amount)<1e-7;
+ });
+ return match?{ok:true,operation:match,tx}:{ok:false,error:'No payment operation matched the treasury, customer wallet, asset and amount for this funding order'};
+}
+
 app.post('/api/admin/funding-orders/:id/confirm',auth,role('owner','admin'),async(req,res)=>{
  const p=z.object({stellarHash:z.string().regex(/^[a-f0-9]{64}$/i)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid Stellar transaction hash'});
@@ -349,15 +369,15 @@ app.post('/api/admin/funding-orders/:id/confirm',auth,role('owner','admin'),asyn
  try{chain=await stellarTransactionStatus(p.data.stellarHash)}
  catch(e){return res.status(503).json({error:'Could not verify the Stellar transaction yet. Try again shortly.'})}
  if(chain.status!=='SUCCESS')return res.status(409).json({error:'Stellar transaction is not successful yet',chain_status:chain.status});
- // Record the successful hash and the expected recipient/asset/order details.
- // A later reconciliation job can re-check the hash. Do not treat a submitted
- // hash as proof that the payment amount/asset/recipient matched until the
- // transaction-operation decoder is enabled for this network.
+ let payment;
+ try{payment=await verifyClassicStellarPayment(p.data.stellarHash,order)}
+ catch(e){return res.status(503).json({error:'Could not verify the Stellar payment operation yet. Try again shortly.'})}
+ if(!payment.ok)return res.status(409).json({error:payment.error});
  const r=await pool.query(`update funding_orders set stellar_hash=$2,status='confirmed',confirmed_at=now(),
    metadata=metadata||$3::jsonb where id=$1 returning id,user_id,amount,stellar_hash,status,created_at,confirmed_at`,
-   [order.id,p.data.stellarHash,JSON.stringify({verified_rpc_status:chain.status,recipient:order.recipient_public_key,asset:order.symbol,issuer:order.issuer,verification_level:'transaction-success-only'})]);
+   [order.id,p.data.stellarHash,JSON.stringify({verified_rpc_status:chain.status,recipient:order.recipient_public_key,asset:order.symbol,issuer:order.issuer,verification_level:'operation-verified',operation_id:payment.operation.id})]);
  await audit(req,'funding.order.confirmed',{order_id:order.id,stellar_hash:p.data.stellarHash,verification_level:'transaction-success-only'});
- res.json({...r.rows[0],warning:'Confirmed on Stellar as SUCCESS. Payment operation amount, asset and recipient still require operation-level verification before unrestricted real-money use.'});
+ res.json({...r.rows[0],verification_level:'operation-verified'});
 });
 
 app.get('/api/admin/stats',auth,role('owner','admin'),async(_,res)=>{
