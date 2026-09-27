@@ -68,7 +68,7 @@ app.post('/api/auth/resend-verification',auth,async(req,res)=>{
  }catch(e){res.status(503).json({error:'Email delivery is not configured yet'});}
 });
 app.post('/api/auth/set-phone',auth,verifiedAccount,async(req,res)=>{
- const p=z.object({phone:z.string().regex(/^\\+?[1-9]\\d{7,14}$/)}).safeParse(req.body);
+ const p=z.object({phone:z.string().regex(/^\+?[1-9]\d{7,14}$/)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid international phone number'});
  await pool.query('update users set phone=$1,phone_verified=false,updated_at=now() where id=$2',[p.data.phone,req.user.sub]);
  await pool.query("update verification_tokens set used_at=now() where user_id=$1 and channel='phone' and used_at is null",[req.user.sub]);
