@@ -13,6 +13,8 @@ import {promisify} from 'util';
 const execFileAsync=promisify(execFile);
 
 const app=express();
+app.disable('x-powered-by');
+app.set('trust proxy',1);
 if(process.env.NODE_ENV==='production' && !process.env.JWT_SECRET) throw new Error('JWT_SECRET is required in production');
 if(!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
 const STELLAR_NETWORK=process.env.STELLAR_NETWORK||'testnet';
@@ -21,9 +23,17 @@ const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.N
 app.use(helmet());
 const allowedOrigins=(process.env.CORS_ORIGIN||'').split(',').map(s=>s.trim()).filter(Boolean);
 if(process.env.NODE_ENV==='production' && !allowedOrigins.length) throw new Error('CORS_ORIGIN is required in production');
+if(process.env.NODE_ENV==='production' && STELLAR_NETWORK==='mainnet'){
+ const required=[['RESEND_API_KEY',process.env.RESEND_API_KEY],['EMAIL_FROM',process.env.EMAIL_FROM],['SMS_PROVIDER_URL',process.env.SMS_PROVIDER_URL],['SMS_PROVIDER_API_KEY',process.env.SMS_PROVIDER_API_KEY],['RECONCILE_SECRET',process.env.RECONCILE_SECRET]];
+ const missing=required.filter(([,v])=>!v).map(([k])=>k);
+ if((process.env.KYC_PROVIDER||'stub').toLowerCase()==='stub') missing.push('KYC_PROVIDER(non-stub)');
+ if(missing.length) throw new Error('Mainnet production configuration incomplete: '+missing.join(', '));
+}
 app.use(cors({origin:(origin,cb)=>{if(!origin||allowedOrigins.includes(origin))return cb(null,true);cb(new Error('Origin not allowed'));},credentials:true}));
 app.use(express.json({limit:'256kb'}));
 app.use(rateLimit({windowMs:900000,max:300,standardHeaders:true,legacyHeaders:false}));
+const authLimiter=rateLimit({windowMs:900000,max:10,standardHeaders:true,legacyHeaders:false,message:{error:'Too many authentication attempts. Try again later.'}});
+const codeLimiter=rateLimit({windowMs:900000,max:5,standardHeaders:true,legacyHeaders:false,message:{error:'Too many verification attempts. Try again later.'}});
 
 const sign=u=>jwt.sign({sub:u.id,role:u.role},process.env.JWT_SECRET,{expiresIn:'30m'});
 const auth=(req,res,next)=>{try{const h=req.headers.authorization||'';if(!h.startsWith('Bearer '))return res.status(401).json({error:'Authentication required'});req.user=jwt.verify(h.slice(7),process.env.JWT_SECRET);next()}catch{return res.status(401).json({error:'Invalid or expired session'})}};
@@ -58,7 +68,7 @@ app.post('/internal/reconcile',async(req,res)=>{
  }catch(e){console.error('reconcile endpoint',e);res.status(500).json({ok:false,error:'Reconciliation failed'});}
 });
 
-app.post('/api/auth/register',async(req,res)=>{
+app.post('/api/auth/register',authLimiter,async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string().min(12),fullName:z.string().min(2).max(120),country:z.enum(['BW','SZ'])}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid registration data'});
  const x=p.data;
@@ -74,7 +84,7 @@ app.post('/api/auth/register',async(req,res)=>{
  }catch(e){if(e?.code==='23505')return res.status(409).json({error:'Email is already registered'});console.error(e);res.status(500).json({error:'Could not create account'})}
 });
 
-app.post('/api/auth/resend-verification',auth,async(req,res)=>{
+app.post('/api/auth/resend-verification',auth,codeLimiter,async(req,res)=>{
  const r=await pool.query('select id,email,email_verified from users where id=$1',[req.user.sub]);
  if(!r.rowCount)return res.status(404).json({error:'User not found'});
  if(r.rows[0].email_verified)return res.json({verified:true,message:'Email is already verified'});
@@ -99,7 +109,7 @@ app.post('/api/auth/set-phone',auth,verifiedAccount,async(req,res)=>{
  if(!rr.ok)return res.status(503).json({error:'SMS delivery failed'});
  res.json({message:'Verification code sent.'});
 });
-app.post('/api/auth/verify-phone',auth,verifiedAccount,async(req,res)=>{
+app.post('/api/auth/verify-phone',auth,verifiedAccount,codeLimiter,async(req,res)=>{
  const p=z.object({code:z.string().regex(/^\d{6}$/)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid 6-digit code'});
  const t=await pool.query("select id from verification_tokens where user_id=$1 and channel='phone' and token_hash=$2 and used_at is null and expires_at>now() order by created_at desc limit 1",[req.user.sub,hashToken(p.data.code)]);
@@ -109,7 +119,7 @@ app.post('/api/auth/verify-phone',auth,verifiedAccount,async(req,res)=>{
  await audit(req,'auth.phone.verified',{});
  res.json({verified:true,message:'Phone verified successfully.'});
 });
-app.post('/api/auth/verify-email',async(req,res)=>{
+app.post('/api/auth/verify-email',codeLimiter,async(req,res)=>{
  const p=z.object({email:z.string().email(),code:z.string().regex(/^\d{6}$/)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid email and 6-digit code'});
  const u=await pool.query('select id,email,email_verified from users where email=$1',[p.data.email.toLowerCase()]);
@@ -122,7 +132,7 @@ app.post('/api/auth/verify-email',async(req,res)=>{
  await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.email.verified',{}]);
  res.json({verified:true,message:'Email verified successfully. You can now sign in.'});
 });
-app.post('/api/auth/forgot-password',async(req,res)=>{
+app.post('/api/auth/forgot-password',authLimiter,async(req,res)=>{
  const p=z.object({email:z.string().email()}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid email'});
  const r=await pool.query('select id,email from users where email=$1',[p.data.email.toLowerCase()]);
@@ -136,7 +146,7 @@ app.post('/api/auth/forgot-password',async(req,res)=>{
  if(!rr.ok)return res.status(503).json({error:'Password recovery email could not be sent'});
  res.json({message:'If that email exists, a reset message will be sent.'});
 });
-app.post('/api/auth/reset-password',async(req,res)=>{
+app.post('/api/auth/reset-password',authLimiter,async(req,res)=>{
  const p=z.object({email:z.string().email(),token:z.string().min(40).max(100),password:z.string().min(12)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid password reset request'});
  const u=await pool.query('select id from users where email=$1',[p.data.email.toLowerCase()]);
@@ -149,7 +159,7 @@ app.post('/api/auth/reset-password',async(req,res)=>{
  await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.password.reset',{}]);
  res.json({message:'Password reset successfully. Please sign in again.'});
 });
-app.post('/api/auth/login',async(req,res)=>{
+app.post('/api/auth/login',authLimiter,async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string()}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid login'});
  const r=await pool.query('select * from users where email=$1',[p.data.email.toLowerCase()]);
@@ -182,7 +192,8 @@ app.post('/api/transactions',auth,verifiedAccount,role('customer','owner','admin
  if(existing.rowCount)return res.status(409).json({error:'This Stellar transaction has already been recorded',transaction_id:existing.rows[0].id,status:existing.rows[0].status});
  let chainStatus='pending';
  try{const chain=await stellarTransactionStatus(p.data.stellarHash);if(chain.status==='SUCCESS')chainStatus='confirmed';else if(chain.status==='FAILED')chainStatus='failed';}catch(e){return res.status(503).json({error:'Could not verify the Stellar transaction yet. Try again shortly.'});}
- const r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,chainStatus,p.data.metadata]);
+ let r;
+ try{ r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,chainStatus,p.data.metadata]);}catch(e){if(e?.code==='23505')return res.status(409).json({error:'This Stellar transaction has already been recorded'});throw e;}
  await audit(req,'transaction.recorded',{type:p.data.type,stellar_hash:p.data.stellarHash,group_id:p.data.groupId||null,status:chainStatus});
  res.status(chainStatus==='confirmed'?201:202).json(r.rows[0]);
 });
@@ -197,7 +208,7 @@ app.post('/api/groups/register',auth,verifiedAccount,role('owner','admin'),async
  res.status(201).json(r.rows[0]);
 });
 
-app.post('/api/wallets',auth,verifiedAccount,kycVerified,async(req,res)=>{const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().min(50).max(60)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid wallet'});const r=await pool.query('insert into wallets(user_id,network,public_key) values($1,$2,$3) on conflict(user_id,network) do update set public_key=excluded.public_key returning id,network,public_key',[req.user.sub,p.data.network,p.data.publicKey]);await audit(req,'wallet.linked',{network:p.data.network});res.status(201).json(r.rows[0])});
+app.post('/api/wallets',auth,verifiedAccount,kycVerified,async(req,res)=>{const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().regex(/^G[A-Z2-7]{55}$/)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid Stellar wallet address'});if(p.data.network!==STELLAR_NETWORK)return res.status(400).json({error:'Wallet network does not match the active platform network',network:STELLAR_NETWORK});const r=await pool.query('insert into wallets(user_id,network,public_key) values($1,$2,$3) on conflict(user_id,network) do update set public_key=excluded.public_key returning id,network,public_key',[req.user.sub,p.data.network,p.data.publicKey]);await audit(req,'wallet.linked',{network:p.data.network});res.status(201).json(r.rows[0])});
 
 app.get('/api/admin/stats',auth,role('owner','admin'),async(_,res)=>{
  const r=await pool.query(`select
@@ -221,8 +232,11 @@ app.get('/api/admin/audit',auth,role('owner'),async(req,res)=>{const r=await poo
 app.patch('/api/admin/users/:id/kyc',auth,role('owner','compliance'),async(req,res)=>{
  const p=z.object({status:z.enum(['pending','verified','rejected']),note:z.string().max(1000).optional()}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid KYC status'});
- const u=await pool.query('select id from users where id=$1',[req.params.id]);
+ const u=await pool.query('select id,kyc_status from users where id=$1',[req.params.id]);
  if(!u.rowCount)return res.status(404).json({error:'User not found'});
+ if(p.data.status!=='pending' && !p.data.note?.trim())return res.status(400).json({error:'A review note is required when changing KYC status'});
+ const session=await pool.query("select id from kyc_sessions where user_id=$1 order by created_at desc limit 1",[req.params.id]);
+ if(!session.rowCount && p.data.status==='verified')return res.status(409).json({error:'Cannot verify KYC without a KYC session'});
  await pool.query('update users set kyc_status=$1,updated_at=now() where id=$2',[p.data.status,req.params.id]);
  await pool.query("update kyc_sessions set status=$1,updated_at=now(),result=result||$2::jsonb where id=(select id from kyc_sessions where user_id=$3 order by created_at desc limit 1)",[p.data.status,JSON.stringify({manual_review:true,note:p.data.note||null,reviewed_at:new Date().toISOString(),reviewed_by:req.user.sub}),req.params.id]);
  await audit(req,'kyc.status.changed',{target:req.params.id,status:p.data.status,note:p.data.note||null});
