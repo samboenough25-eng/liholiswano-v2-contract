@@ -21,6 +21,7 @@ const auth=(req,res,next)=>{try{const h=req.headers.authorization||'';if(!h.star
 const role=(...roles)=>(req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:'Insufficient permission'});
 const audit=async(req,action,metadata={})=>{try{await pool.query('insert into audit_log(user_id,action,ip,metadata) values($1,$2,$3,$4)',[req.user?.sub||null,action,req.ip,metadata])}catch{}};
 const kycVerified=async(req,res,next)=>{const r=await pool.query('select kyc_status from users where id=$1',[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:'User not found'});if(r.rows[0].kyc_status!=='verified')return res.status(403).json({error:'KYC verification is required before this financial operation',kyc_status:r.rows[0].kyc_status});next()};
+const verifiedAccount=async(req,res,next)=>{const r=await pool.query('select email_verified from users where id=$1',[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:'User not found'});if(!r.rows[0].email_verified)return res.status(403).json({error:'Email verification is required',email_verification_required:true});next()};
 const hashToken=v=>crypto.createHash('sha256').update(v).digest('hex');
 const makeCode=()=>String(crypto.randomInt(100000,1000000));
 const sendVerificationEmail=async(to,code)=>{
@@ -84,14 +85,14 @@ app.post('/api/auth/login',async(req,res)=>{
 
 app.get('/api/me',auth,async(req,res)=>{const r=await pool.query('select id,email,full_name,country,role,kyc_status,kyc_reference,created_at from users where id=$1',[req.user.sub]);res.json(r.rows[0]||null)});
 
-app.post('/api/kyc/session',auth,async(req,res)=>{
+app.post('/api/kyc/session',auth,verifiedAccount,async(req,res)=>{
  const ref='KYC-'+crypto.randomUUID();await pool.query('update users set kyc_reference=$1,updated_at=now() where id=$2',[ref,req.user.sub]);await audit(req,'kyc.session.created',{provider:process.env.KYC_PROVIDER||'stub'});res.status(201).json({status:'pending',reference:ref,provider:process.env.KYC_PROVIDER||'stub',message:'Connect an approved KYC provider before production activation.'})
 });
 
-app.get('/api/transactions',auth,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
-app.get('/api/notifications',auth,async(req,res)=>{const r=await pool.query('select * from notifications where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
-app.get('/api/groups',auth,async(req,res)=>{const r=await pool.query(`select g.id,g.contract_id,g.status,g.created_at,m.status as membership_status,m.joined_at from groups g join memberships m on m.group_id=g.id where m.user_id=$1 order by g.created_at desc`,[req.user.sub]);res.json(r.rows)});
-app.post('/api/wallets',auth,async(req,res)=>{const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().min(50).max(60)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid wallet'});const r=await pool.query('insert into wallets(user_id,network,public_key) values($1,$2,$3) on conflict(user_id,network) do update set public_key=excluded.public_key returning id,network,public_key',[req.user.sub,p.data.network,p.data.publicKey]);await audit(req,'wallet.linked',{network:p.data.network});res.status(201).json(r.rows[0])});
+app.get('/api/transactions',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
+app.get('/api/notifications',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select * from notifications where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
+app.get('/api/groups',auth,verifiedAccount,async(req,res)=>{const r=await pool.query(`select g.id,g.contract_id,g.status,g.created_at,m.status as membership_status,m.joined_at from groups g join memberships m on m.group_id=g.id where m.user_id=$1 order by g.created_at desc`,[req.user.sub]);res.json(r.rows)});
+app.post('/api/wallets',auth,verifiedAccount,kycVerified,async(req,res)=>{const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().min(50).max(60)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid wallet'});const r=await pool.query('insert into wallets(user_id,network,public_key) values($1,$2,$3) on conflict(user_id,network) do update set public_key=excluded.public_key returning id,network,public_key',[req.user.sub,p.data.network,p.data.publicKey]);await audit(req,'wallet.linked',{network:p.data.network});res.status(201).json(r.rows[0])});
 
 app.get('/api/admin/stats',auth,role('owner','admin'),async(_,res)=>{
  const r=await pool.query(`select
