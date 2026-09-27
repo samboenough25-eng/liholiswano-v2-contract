@@ -13,9 +13,15 @@ import {promisify} from 'util';
 const execFileAsync=promisify(execFile);
 
 const app=express();
+if(process.env.NODE_ENV==='production' && !process.env.JWT_SECRET) throw new Error('JWT_SECRET is required in production');
+if(!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+const STELLAR_NETWORK=process.env.STELLAR_NETWORK||'testnet';
+const STELLAR_RPC_URL=process.env.STELLAR_RPC_URL||'https://soroban-testnet.stellar.org';
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false});
 app.use(helmet());
-app.use(cors({origin:process.env.CORS_ORIGIN?.split(',').map(s=>s.trim())||true,credentials:true}));
+const allowedOrigins=(process.env.CORS_ORIGIN||'').split(',').map(s=>s.trim()).filter(Boolean);
+if(process.env.NODE_ENV==='production' && !allowedOrigins.length) throw new Error('CORS_ORIGIN is required in production');
+app.use(cors({origin:(origin,cb)=>{if(!origin||allowedOrigins.includes(origin))return cb(null,true);cb(new Error('Origin not allowed'));},credentials:true}));
 app.use(express.json({limit:'256kb'}));
 app.use(rateLimit({windowMs:900000,max:300,standardHeaders:true,legacyHeaders:false}));
 
@@ -27,6 +33,7 @@ const kycVerified=async(req,res,next)=>{const r=await pool.query('select kyc_sta
 const verifiedAccount=async(req,res,next)=>{const r=await pool.query('select email_verified from users where id=$1',[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:'User not found'});if(!r.rows[0].email_verified)return res.status(403).json({error:'Email verification is required',email_verification_required:true});next()};
 const hashToken=v=>crypto.createHash('sha256').update(v).digest('hex');
 const makeCode=()=>String(crypto.randomInt(100000,1000000));
+async function stellarTransactionStatus(hash){const r=await fetch(STELLAR_RPC_URL,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:Date.now(),method:'getTransaction',params:{hash}})});if(!r.ok)throw new Error('Stellar RPC HTTP '+r.status);const j=await r.json();if(j.error)throw new Error(j.error.message||'Stellar RPC error');return j.result;}
 const sendVerificationEmail=async(to,code)=>{
  const key=process.env.RESEND_API_KEY;
  const from=process.env.EMAIL_FROM;
@@ -93,7 +100,7 @@ app.post('/api/auth/set-phone',auth,verifiedAccount,async(req,res)=>{
  res.json({message:'Verification code sent.'});
 });
 app.post('/api/auth/verify-phone',auth,verifiedAccount,async(req,res)=>{
- const p=z.object({code:z.string().regex(/^\\d{6}$/)}).safeParse(req.body);
+ const p=z.object({code:z.string().regex(/^\d{6}$/)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid 6-digit code'});
  const t=await pool.query("select id from verification_tokens where user_id=$1 and channel='phone' and token_hash=$2 and used_at is null and expires_at>now() order by created_at desc limit 1",[req.user.sub,hashToken(p.data.code)]);
  if(!t.rowCount)return res.status(400).json({error:'Invalid or expired phone verification code'});
@@ -169,11 +176,15 @@ app.get('/api/kyc/status',auth,verifiedAccount,async(req,res)=>{
 
 app.get('/api/transactions',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
 app.post('/api/transactions',auth,verifiedAccount,role('customer','owner','admin'),async(req,res)=>{
- const p=z.object({groupId:z.string().min(1).max(32).optional(),type:z.enum(['join','contribute','bid','settle','refund','default','create_group','lock_group']),asset:z.string().max(80).optional(),amount:z.number().finite().nonnegative().optional(),stellarHash:z.string().regex(/^[a-f0-9]{64}$/i),status:z.enum(['pending','confirmed','failed']).default('confirmed'),metadata:z.record(z.any()).default({})}).safeParse(req.body);
+ const p=z.object({groupId:z.string().min(1).max(32).optional(),type:z.enum(['join','contribute','bid','settle','refund','default','create_group','lock_group']),asset:z.string().max(80).optional(),amount:z.number().finite().nonnegative().optional(),stellarHash:z.string().regex(/^[a-f0-9]{64}$/i),metadata:z.record(z.any()).default({})}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid transaction record'});
- const r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,p.data.status,p.data.metadata]);
- await audit(req,'transaction.recorded',{type:p.data.type,stellar_hash:p.data.stellarHash,group_id:p.data.groupId||null});
- res.status(201).json(r.rows[0]);
+ const existing=await pool.query('select id,status from transactions where stellar_hash=$1 limit 1',[p.data.stellarHash]);
+ if(existing.rowCount)return res.status(409).json({error:'This Stellar transaction has already been recorded',transaction_id:existing.rows[0].id,status:existing.rows[0].status});
+ let chainStatus='pending';
+ try{const chain=await stellarTransactionStatus(p.data.stellarHash);if(chain.status==='SUCCESS')chainStatus='confirmed';else if(chain.status==='FAILED')chainStatus='failed';}catch(e){return res.status(503).json({error:'Could not verify the Stellar transaction yet. Try again shortly.'});}
+ const r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,chainStatus,p.data.metadata]);
+ await audit(req,'transaction.recorded',{type:p.data.type,stellar_hash:p.data.stellarHash,group_id:p.data.groupId||null,status:chainStatus});
+ res.status(chainStatus==='confirmed'?201:202).json(r.rows[0]);
 });
 
 app.get('/api/notifications',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select * from notifications where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
@@ -208,8 +219,14 @@ app.get('/api/admin/transactions',auth,role('owner','admin'),async(req,res)=>{
 });
 app.get('/api/admin/audit',auth,role('owner'),async(req,res)=>{const r=await pool.query(`select a.id,a.action,a.ip,a.metadata,a.created_at,u.email from audit_log a left join users u on u.id=a.user_id order by a.created_at desc limit 500`);res.json(r.rows)});
 app.patch('/api/admin/users/:id/kyc',auth,role('owner','compliance'),async(req,res)=>{
- const p=z.object({status:z.enum(['pending','verified','rejected'])}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid KYC status'});
- await pool.query('update users set kyc_status=$1,updated_at=now() where id=$2',[p.data.status,req.params.id]);await audit(req,'kyc.status.changed',{target:req.params.id,status:p.data.status});res.json({ok:true});
+ const p=z.object({status:z.enum(['pending','verified','rejected']),note:z.string().max(1000).optional()}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid KYC status'});
+ const u=await pool.query('select id from users where id=$1',[req.params.id]);
+ if(!u.rowCount)return res.status(404).json({error:'User not found'});
+ await pool.query('update users set kyc_status=$1,updated_at=now() where id=$2',[p.data.status,req.params.id]);
+ await pool.query("update kyc_sessions set status=$1,updated_at=now(),result=result||$2::jsonb where id=(select id from kyc_sessions where user_id=$3 order by created_at desc limit 1)",[p.data.status,JSON.stringify({manual_review:true,note:p.data.note||null,reviewed_at:new Date().toISOString(),reviewed_by:req.user.sub}),req.params.id]);
+ await audit(req,'kyc.status.changed',{target:req.params.id,status:p.data.status,note:p.data.note||null});
+ res.json({ok:true,status:p.data.status});
 });
 app.use((err,_,res,next)=>{console.error(err);if(res.headersSent)return next(err);res.status(500).json({error:'Internal server error'})});
 app.listen(Number(process.env.PORT||8080),()=>console.log('Liholiswano API started'));
