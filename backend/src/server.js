@@ -106,7 +106,7 @@ app.get('/api/kyc/status',auth,verifiedAccount,async(req,res)=>{
 });
 
 app.get('/api/transactions',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
-app.post('/api/transactions',auth,verifiedAccount,kycVerified,async(req,res)=>{
+app.post('/api/transactions',auth,verifiedAccount,role('customer','owner','admin'),async(req,res)=>{
  const p=z.object({groupId:z.string().min(1).max(32).optional(),type:z.enum(['join','contribute','bid','settle','refund','default','create_group','lock_group']),asset:z.string().max(80).optional(),amount:z.number().finite().nonnegative().optional(),stellarHash:z.string().regex(/^[a-f0-9]{64}$/i),status:z.enum(['pending','confirmed','failed']).default('confirmed'),metadata:z.record(z.any()).default({})}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid transaction record'});
  const r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,p.data.status,p.data.metadata]);
