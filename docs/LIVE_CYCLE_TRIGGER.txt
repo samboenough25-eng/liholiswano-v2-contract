@@ -1,1 +1,1 @@
-Final Testnet verification trigger for the current MVP.
+Testnet was reset; redeploy the current contract and run the full live cycle.
