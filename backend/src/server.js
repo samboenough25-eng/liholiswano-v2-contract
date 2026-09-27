@@ -8,6 +8,9 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import {Pool} from 'pg';
 import {z} from 'zod';
+import {execFile} from 'child_process';
+import {promisify} from 'util';
+const execFileAsync=promisify(execFile);
 
 const app=express();
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false});
@@ -38,6 +41,15 @@ const sendVerificationEmail=async(to,code)=>{
 };
 
 app.get('/health',async(_,res)=>{try{await pool.query('select 1');res.json({ok:true,service:'liholiswano-api',network:process.env.STELLAR_NETWORK||'testnet'})}catch{res.status(503).json({ok:false})}});
+
+app.post('/internal/reconcile',async(req,res)=>{
+ const expected=process.env.RECONCILE_SECRET;
+ if(!expected||req.get('x-reconcile-secret')!==expected)return res.status(401).json({error:'Unauthorized'});
+ try{
+   const {stdout,stderr}=await execFileAsync(process.execPath,['src/reconcile.js'],{cwd:new URL('..',import.meta.url).pathname,timeout:120000,maxBuffer:1024*1024});
+   res.json({ok:true,output:stdout.trim(),error:stderr.trim()||undefined});
+ }catch(e){console.error('reconcile endpoint',e);res.status(500).json({ok:false,error:'Reconciliation failed'});}
+});
 
 app.post('/api/auth/register',async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string().min(12),fullName:z.string().min(2).max(120),country:z.enum(['BW','SZ'])}).safeParse(req.body);
