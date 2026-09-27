@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "backend/**"
+      - "index.html"
       - "customer.html"
       - "owner.html"
       - "platform.html"
@@ -12,6 +13,7 @@ on:
   pull_request:
     paths:
       - "backend/**"
+      - "index.html"
       - "customer.html"
       - "owner.html"
       - "platform.html"
@@ -26,23 +28,26 @@ jobs:
         with:
           node-version: 20
       - name: Install backend dependencies
-        run: npm install
+        run: npm install --ignore-scripts
       - name: Check backend JavaScript
         run: |
           node --check backend/src/server.js
           node --check backend/src/migrate.js
           node --check backend/src/reconcile.js
-      - name: Check inline module JavaScript
+      - name: Check inline JavaScript in every portal
         run: |
           python - <<'PY'
           import re, subprocess, pathlib, tempfile
-          for name in ["customer.html","owner.html"]:
-              s=pathlib.Path(name).read_text()
-              blocks=re.findall(r'<script type="module">(.*?)</script>',s,re.S)
-              if not blocks:
-                  raise SystemExit(f"No module script found in {name}")
-              for i,b in enumerate(blocks):
-                  p=pathlib.Path(tempfile.gettempdir())/f"{name}.{i}.mjs"
-                  p.write_text(b)
-                  subprocess.run(["node","--check",str(p)],check=True)
+          files = ["index.html","platform.html","customer.html","owner.html","compliance.html"]
+          for name in files:
+              s = pathlib.Path(name).read_text(encoding="utf-8")
+              blocks = re.findall(r'<script(?:\s+type="module")?\s*>(.*?)</script>', s, re.S | re.I)
+              for i, block in enumerate(blocks):
+                  if not block.strip():
+                      continue
+                  tag = re.search(r'<script\s+type="module"\s*>', s, re.I)
+                  suffix = "mjs" if tag else "js"
+                  p = pathlib.Path(tempfile.gettempdir()) / f"{name}.{i}.{suffix}"
+                  p.write_text(block, encoding="utf-8")
+                  subprocess.run(["node","--check",str(p)], check=True)
           PY
