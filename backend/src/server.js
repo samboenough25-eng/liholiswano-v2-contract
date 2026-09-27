@@ -204,7 +204,18 @@ app.post('/api/groups/register',auth,verifiedAccount,role('owner','admin'),async
  const p=z.object({id:z.string().min(1).max(32).regex(/^[A-Za-z0-9_]+$/),contractId:z.string().regex(/^C[A-Z2-7]{55}$/),status:z.enum(['open','locked','completed']).default('open')}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid group registration'});
  const r=await pool.query('insert into groups(id,contract_id,admin_user_id,status) values($1,$2,$3,$4) on conflict(id) do update set contract_id=excluded.contract_id,status=excluded.status returning *',[p.data.id,p.data.contractId,req.user.sub,p.data.status]);
+ await pool.query("insert into memberships(group_id,user_id,status) values($1,$2,'active') on conflict(group_id,user_id) do update set status='active'",[p.data.id,req.user.sub]);
  await audit(req,'group.registered',{group_id:p.data.id,contract_id:p.data.contractId});
+ res.status(201).json(r.rows[0]);
+});
+
+app.post('/api/groups/:id/join',auth,verifiedAccount,kycVerified,async(req,res)=>{
+ const id=req.params.id;
+ const g=await pool.query('select id,status from groups where id=$1',[id]);
+ if(!g.rowCount)return res.status(404).json({error:'Group is not registered in the platform'});
+ if(g.rows[0].status==='completed')return res.status(409).json({error:'Group is already completed'});
+ const r=await pool.query("insert into memberships(group_id,user_id,status) values($1,$2,'active') on conflict(group_id,user_id) do update set status='active' returning group_id,user_id,status,joined_at",[id,req.user.sub]);
+ await audit(req,'group.member.joined',{group_id:id});
  res.status(201).json(r.rows[0]);
 });
 
