@@ -67,6 +67,29 @@ app.post('/api/auth/resend-verification',auth,async(req,res)=>{
    res.json({verified:false,development_code:delivery.development?code:undefined,message:'A new verification code was sent.'});
  }catch(e){res.status(503).json({error:'Email delivery is not configured yet'});}
 });
+app.post('/api/auth/set-phone',auth,verifiedAccount,async(req,res)=>{
+ const p=z.object({phone:z.string().regex(/^\\+?[1-9]\\d{7,14}$/)}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Enter a valid international phone number'});
+ await pool.query('update users set phone=$1,phone_verified=false,updated_at=now() where id=$2',[p.data.phone,req.user.sub]);
+ await pool.query("update verification_tokens set used_at=now() where user_id=$1 and channel='phone' and used_at is null",[req.user.sub]);
+ const code=makeCode();
+ await pool.query("insert into verification_tokens(user_id,channel,token_hash,expires_at) values($1,'phone',$2,now()+interval '15 minutes')",[req.user.sub,hashToken(code)]);
+ const url=process.env.SMS_PROVIDER_URL,key=process.env.SMS_PROVIDER_API_KEY;
+ if(!url||!key)return res.status(503).json({error:'SMS provider is not configured yet'});
+ const rr=await fetch(url,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({to:p.data.phone,message:'Your Liholiswano phone verification code is '+code+'. It expires in 15 minutes.'})});
+ if(!rr.ok)return res.status(503).json({error:'SMS delivery failed'});
+ res.json({message:'Verification code sent.'});
+});
+app.post('/api/auth/verify-phone',auth,verifiedAccount,async(req,res)=>{
+ const p=z.object({code:z.string().regex(/^\\d{6}$/)}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Enter a valid 6-digit code'});
+ const t=await pool.query("select id from verification_tokens where user_id=$1 and channel='phone' and token_hash=$2 and used_at is null and expires_at>now() order by created_at desc limit 1",[req.user.sub,hashToken(p.data.code)]);
+ if(!t.rowCount)return res.status(400).json({error:'Invalid or expired phone verification code'});
+ await pool.query('update verification_tokens set used_at=now() where id=$1',[t.rows[0].id]);
+ await pool.query('update users set phone_verified=true,updated_at=now() where id=$1',[req.user.sub]);
+ await audit(req,'auth.phone.verified',{});
+ res.json({verified:true,message:'Phone verified successfully.'});
+});
 app.post('/api/auth/verify-email',async(req,res)=>{
  const p=z.object({email:z.string().email(),code:z.string().regex(/^\d{6}$/)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid email and 6-digit code'});
