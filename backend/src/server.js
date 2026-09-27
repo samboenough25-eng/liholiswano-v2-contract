@@ -317,6 +317,17 @@ app.post('/api/admin/funding-orders',auth,role('owner','admin'),async(req,res)=>
  }
 });
 
+app.get('/api/admin/funding-orders/:id',auth,role('owner','admin'),async(req,res)=>{
+ const r=await pool.query(`select f.id,f.user_id,f.amount,f.stellar_hash,f.status,f.idempotency_key,f.metadata,
+   a.symbol,a.issuer,a.network,a.decimals,a.contract_address,t.public_key as treasury_public_key,
+   w.public_key as recipient_public_key,u.email,u.full_name
+   from funding_orders f join users u on u.id=f.user_id join supported_assets a on a.id=f.asset_id
+   join treasury_accounts t on t.id=f.treasury_account_id
+   join wallets w on w.user_id=f.user_id and w.network=a.network where f.id=$1`,[req.params.id]);
+ if(!r.rowCount)return res.status(404).json({error:'Funding order not found'});
+ res.json(r.rows[0]);
+});
+
 app.post('/api/admin/funding-orders/:id/confirm',auth,role('owner','admin'),async(req,res)=>{
  const p=z.object({stellarHash:z.string().regex(/^[a-f0-9]{64}$/i)}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Enter a valid Stellar transaction hash'});
