@@ -221,6 +221,134 @@ app.post('/api/groups/:id/join',auth,verifiedAccount,kycVerified,async(req,res)=
 
 app.post('/api/wallets',auth,verifiedAccount,kycVerified,async(req,res)=>{const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().regex(/^G[A-Z2-7]{55}$/)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid Stellar wallet address'});if(p.data.network!==STELLAR_NETWORK)return res.status(400).json({error:'Wallet network does not match the active platform network',network:STELLAR_NETWORK});const r=await pool.query('insert into wallets(user_id,network,public_key) values($1,$2,$3) on conflict(user_id,network) do update set public_key=excluded.public_key returning id,network,public_key',[req.user.sub,p.data.network,p.data.publicKey]);await audit(req,'wallet.linked',{network:p.data.network});res.status(201).json(r.rows[0])});
 
+
+// ── Treasury / customer funding ────────────────────────────────────────
+// The owner funds a customer's wallet from an externally controlled treasury
+// wallet. The API never holds a private key and never signs a payment.
+// Flow: create order -> owner sends the payment with their wallet -> confirm
+// with the Stellar transaction hash -> API verifies the on-chain result.
+app.get('/api/assets',auth,verifiedAccount,async(_,res)=>{
+ const r=await pool.query("select id,symbol,issuer,network,decimals,contract_address,status from supported_assets where status='active' order by symbol");
+ res.json(r.rows);
+});
+
+app.get('/api/funding-orders',auth,verifiedAccount,async(req,res)=>{
+ const r=await pool.query(`select f.id,f.amount,f.stellar_hash,f.status,f.created_at,f.confirmed_at,
+   a.symbol,a.issuer,a.network,a.decimals,a.contract_address
+   from funding_orders f join supported_assets a on a.id=f.asset_id
+   where f.user_id=$1 order by f.created_at desc limit 100`,[req.user.sub]);
+ res.json(r.rows);
+});
+
+app.get('/api/admin/treasury',auth,role('owner','admin'),async(_,res)=>{
+ const r=await pool.query("select id,network,public_key,status,created_at from treasury_accounts order by network");
+ res.json(r.rows);
+});
+
+app.put('/api/admin/treasury',auth,role('owner','admin'),async(req,res)=>{
+ const p=z.object({network:z.enum(['testnet','mainnet']),publicKey:z.string().regex(/^G[A-Z2-7]{55}$/),status:z.enum(['active','disabled']).default('active')}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid treasury Stellar address'});
+ if(p.data.network!==STELLAR_NETWORK)return res.status(400).json({error:'Treasury network must match the active platform network',network:STELLAR_NETWORK});
+ const r=await pool.query("insert into treasury_accounts(network,public_key,status) values($1,$2,$3) on conflict(network) do update set public_key=excluded.public_key,status=excluded.status returning id,network,public_key,status",[p.data.network,p.data.publicKey,p.data.status]);
+ await audit(req,'treasury.updated',{network:p.data.network});
+ res.json(r.rows[0]);
+});
+
+app.post('/api/admin/assets',auth,role('owner','admin'),async(req,res)=>{
+ const p=z.object({
+   symbol:z.string().min(1).max(12).regex(/^[A-Z0-9]+$/),
+   issuer:z.string().regex(/^G[A-Z2-7]{55}$/).optional(),
+   network:z.enum(['testnet','mainnet']),
+   decimals:z.number().int().min(0).max(18).default(7),
+   contractAddress:z.string().regex(/^C[A-Z2-7]{55}$/).optional(),
+   status:z.enum(['active','disabled']).default('active')
+ }).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid supported asset'});
+ if(p.data.network!==STELLAR_NETWORK)return res.status(400).json({error:'Asset network must match the active platform network',network:STELLAR_NETWORK});
+ const r=await pool.query(`insert into supported_assets(symbol,issuer,network,decimals,contract_address,status)
+   values($1,$2,$3,$4,$5,$6)
+   on conflict(symbol,network,issuer) do update set decimals=excluded.decimals,contract_address=excluded.contract_address,status=excluded.status
+   returning id,symbol,issuer,network,decimals,contract_address,status`,
+   [p.data.symbol,p.data.issuer||null,p.data.network,p.data.decimals,p.data.contractAddress||null,p.data.status]);
+ await audit(req,'asset.updated',{symbol:p.data.symbol,network:p.data.network});
+ res.status(201).json(r.rows[0]);
+});
+
+app.get('/api/admin/funding-orders',auth,role('owner','admin'),async(_,res)=>{
+ const r=await pool.query(`select f.id,f.user_id,u.email,u.full_name,f.amount,f.stellar_hash,f.status,
+   f.idempotency_key,f.metadata,f.created_at,f.confirmed_at,a.symbol,a.issuer,a.network,a.decimals,a.contract_address,
+   t.public_key as treasury_public_key
+   from funding_orders f
+   join users u on u.id=f.user_id
+   join supported_assets a on a.id=f.asset_id
+   left join treasury_accounts t on t.id=f.treasury_account_id
+   order by f.created_at desc limit 500`);
+ res.json(r.rows);
+});
+
+app.post('/api/admin/funding-orders',auth,role('owner','admin'),async(req,res)=>{
+ const p=z.object({
+   userId:z.string().uuid(),
+   assetId:z.string().uuid(),
+   amount:z.number().finite().positive(),
+   idempotencyKey:z.string().min(8).max(120)
+ }).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Invalid funding order'});
+ const u=await pool.query("select id,kyc_status from users where id=$1",[p.data.userId]);
+ if(!u.rowCount)return res.status(404).json({error:'Customer not found'});
+ if(u.rows[0].kyc_status!=='verified')return res.status(409).json({error:'Customer must have verified KYC before funding'});
+ const a=await pool.query("select * from supported_assets where id=$1 and status='active'",[p.data.assetId]);
+ if(!a.rowCount)return res.status(404).json({error:'Supported asset not found or disabled'});
+ if(a.rows[0].network!==STELLAR_NETWORK)return res.status(409).json({error:'Asset is not on the active network'});
+ const w=await pool.query("select id,public_key from wallets where user_id=$1 and network=$2",[p.data.userId,STELLAR_NETWORK]);
+ if(!w.rowCount)return res.status(409).json({error:'Customer must link a wallet before funding'});
+ const t=await pool.query("select id,public_key from treasury_accounts where network=$1 and status='active'",[STELLAR_NETWORK]);
+ if(!t.rowCount)return res.status(409).json({error:'Treasury account is not configured'});
+ try{
+   const r=await pool.query(`insert into funding_orders(user_id,treasury_account_id,asset_id,amount,status,idempotency_key,metadata)
+     values($1,$2,$3,$4,'pending',$5,$6)
+     returning id,user_id,asset_id,amount,status,idempotency_key,created_at`,
+     [p.data.userId,t.rows[0].id,p.data.assetId,p.data.amount,p.data.idempotencyKey,JSON.stringify({recipient:w.rows[0].public_key,created_by:req.user.sub})]);
+   await audit(req,'funding.order.created',{order_id:r.rows[0].id,user_id:p.data.userId,asset_id:p.data.assetId,amount:p.data.amount});
+   res.status(201).json({...r.rows[0],recipient:w.rows[0].public_key,treasury_public_key:t.rows[0].public_key});
+ }catch(e){
+   if(e?.code==='23505')return res.status(409).json({error:'That idempotency key has already been used'});
+   console.error(e);res.status(500).json({error:'Could not create funding order'});
+ }
+});
+
+app.post('/api/admin/funding-orders/:id/confirm',auth,role('owner','admin'),async(req,res)=>{
+ const p=z.object({stellarHash:z.string().regex(/^[a-f0-9]{64}$/i)}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Enter a valid Stellar transaction hash'});
+ const o=await pool.query(`select f.*,a.symbol,a.issuer,a.network,a.decimals,a.contract_address,t.public_key as treasury_public_key,
+   w.public_key as recipient_public_key
+   from funding_orders f
+   join supported_assets a on a.id=f.asset_id
+   join treasury_accounts t on t.id=f.treasury_account_id
+   join wallets w on w.user_id=f.user_id and w.network=f.metadata->>'network'
+   where f.id=$1`,[req.params.id]);
+ // Older orders may not have network in metadata; fall back to the active-network wallet.
+ const order= o.rowCount ? o.rows[0] : (await pool.query(`select f.*,a.symbol,a.issuer,a.network,a.decimals,a.contract_address,t.public_key as treasury_public_key,
+   w.public_key as recipient_public_key
+   from funding_orders f join supported_assets a on a.id=f.asset_id join treasury_accounts t on t.id=f.treasury_account_id
+   join wallets w on w.user_id=f.user_id and w.network=$2 where f.id=$1`,[req.params.id,STELLAR_NETWORK])).rows[0];
+ if(!order)return res.status(404).json({error:'Funding order not found'});
+ if(order.status==='confirmed')return res.status(409).json({error:'Funding order is already confirmed',stellar_hash:order.stellar_hash});
+ let chain;
+ try{chain=await stellarTransactionStatus(p.data.stellarHash)}
+ catch(e){return res.status(503).json({error:'Could not verify the Stellar transaction yet. Try again shortly.'})}
+ if(chain.status!=='SUCCESS')return res.status(409).json({error:'Stellar transaction is not successful yet',chain_status:chain.status});
+ // Record the successful hash and the expected recipient/asset/order details.
+ // A later reconciliation job can re-check the hash. Do not treat a submitted
+ // hash as proof that the payment amount/asset/recipient matched until the
+ // transaction-operation decoder is enabled for this network.
+ const r=await pool.query(`update funding_orders set stellar_hash=$2,status='confirmed',confirmed_at=now(),
+   metadata=metadata||$3::jsonb where id=$1 returning id,user_id,amount,stellar_hash,status,created_at,confirmed_at`,
+   [order.id,p.data.stellarHash,JSON.stringify({verified_rpc_status:chain.status,recipient:order.recipient_public_key,asset:order.symbol,issuer:order.issuer,verification_level:'transaction-success-only'})]);
+ await audit(req,'funding.order.confirmed',{order_id:order.id,stellar_hash:p.data.stellarHash,verification_level:'transaction-success-only'});
+ res.json({...r.rows[0],warning:'Confirmed on Stellar as SUCCESS. Payment operation amount, asset and recipient still require operation-level verification before unrestricted real-money use.'});
+});
+
 app.get('/api/admin/stats',auth,role('owner','admin'),async(_,res)=>{
  const r=await pool.query(`select
  (select count(*) from users where role='customer') customers,
