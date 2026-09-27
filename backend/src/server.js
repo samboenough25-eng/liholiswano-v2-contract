@@ -69,13 +69,9 @@ app.post('/api/auth/verify-email',async(req,res)=>{
  if(u.rows[0].email_verified)return res.json({verified:true,message:'Email is already verified'});
  const t=await pool.query("select id from verification_tokens where user_id=$1 and channel='email' and token_hash=$2 and used_at is null and expires_at>now() order by created_at desc limit 1",[u.rows[0].id,hashToken(p.data.code)]);
  if(!t.rowCount)return res.status(400).json({error:'Invalid or expired verification code'});
- await pool.query('begin');
- try{
-   await pool.query('update verification_tokens set used_at=now() where id=$1',[t.rows[0].id]);
-   await pool.query('update users set email_verified=true,updated_at=now() where id=$1',[u.rows[0].id]);
-   await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.email.verified',{}]);
-   await pool.query('commit');
- }catch(e){await pool.query('rollback');throw e}
+ await pool.query('update verification_tokens set used_at=now() where id=$1',[t.rows[0].id]);
+ await pool.query('update users set email_verified=true,updated_at=now() where id=$1',[u.rows[0].id]);
+ await pool.query('insert into audit_log(user_id,action,metadata) values($1,$2,$3)',[u.rows[0].id,'auth.email.verified',{}]);
  res.json({verified:true,message:'Email verified successfully. You can now sign in.'});
 });
 app.post('/api/auth/login',async(req,res)=>{
