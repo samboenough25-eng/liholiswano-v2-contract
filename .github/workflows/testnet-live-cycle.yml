@@ -5,6 +5,12 @@ name: Testnet - initialize + live test cycle (existing contract)
 # everything else. This workflow is for the current deployed v2.2 contract.
 
 on:
+  workflow_call:
+    inputs:
+      contract_id:
+        description: "Deployed Liholiswano contract ID"
+        required: true
+        type: string
   push:
     branches: [main]
   workflow_dispatch:
@@ -16,7 +22,7 @@ on:
 
 jobs:
   cycle:
-    if: github.event_name == 'workflow_dispatch' || (contains(github.event.head_commit.message, '[run-live-cycle]') && !contains(github.event.head_commit.message, '[deploy-testnet]'))
+    if: github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[run-live-cycle]') && !contains(github.event.head_commit.message, '[deploy-testnet]'))
     runs-on: ubuntu-latest
     env:
       CID: ${{ inputs.contract_id || 'CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY' }}
