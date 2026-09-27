@@ -2,11 +2,14 @@ name: Build and deploy v2 to Stellar Testnet
 
 on:
   workflow_dispatch: {}
+  push:
+    branches: [main]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[deploy-testnet]')
     env:
       HAS_ADMIN_SECRET: ${{ secrets.STELLAR_ADMIN_SECRET != '' }}
       USDC_TESTNET_ISSUER: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
@@ -39,7 +42,7 @@ jobs:
       # 3. INSTALL STELLAR CLI
       # ---------------------------------------------------------
       - name: Install the Stellar CLI
-        uses: stellar/stellar-cli@v23.0.1
+        uses: stellar/stellar-cli@v27.0.0
 
 
       # ---------------------------------------------------------
