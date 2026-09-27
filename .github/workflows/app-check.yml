@@ -1,0 +1,48 @@
+name: Application checks
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - "customer.html"
+      - "owner.html"
+      - "platform.html"
+      - "compliance.html"
+      - ".github/workflows/app-check.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "customer.html"
+      - "owner.html"
+      - "platform.html"
+      - "compliance.html"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install backend dependencies
+        run: npm install
+      - name: Check backend JavaScript
+        run: |
+          node --check backend/src/server.js
+          node --check backend/src/migrate.js
+          node --check backend/src/reconcile.js
+      - name: Check inline module JavaScript
+        run: |
+          python - <<'PY'
+          import re, subprocess, pathlib, tempfile
+          for name in ["customer.html","owner.html"]:
+              s=pathlib.Path(name).read_text()
+              blocks=re.findall(r'<script type="module">(.*?)</script>',s,re.S)
+              if not blocks:
+                  raise SystemExit(f"No module script found in {name}")
+              for i,b in enumerate(blocks):
+                  p=pathlib.Path(tempfile.gettempdir())/f"{name}.{i}.mjs"
+                  p.write_text(b)
+                  subprocess.run(["node","--check",str(p)],check=True)
+          PY
