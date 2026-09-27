@@ -1,1 +1,1 @@
-Testnet was reset; redeploy the current contract and run the full live cycle.
+Redeploy and republish Testnet runtime configuration using the latest deployment workflow.
