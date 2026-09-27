@@ -566,3 +566,5 @@ jobs:
     with:
       contract_id: ${{ needs.deploy.outputs.contract_id }}
     secrets: inherit
+
+# redeploy trigger
