@@ -68,3 +68,5 @@ create table if not exists password_reset_tokens(
  created_at timestamptz not null default now()
 );
 create index if not exists password_reset_tokens_user on password_reset_tokens(user_id,created_at desc);
+
+create unique index if not exists transactions_stellar_hash_unique on transactions(stellar_hash) where stellar_hash is not null;
