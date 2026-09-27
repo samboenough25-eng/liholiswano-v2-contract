@@ -43,11 +43,16 @@ app.post('/api/auth/register',async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string().min(12),fullName:z.string().min(2).max(120),country:z.enum(['BW','SZ'])}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid registration data'});
  const x=p.data;
- try{const hash=await bcrypt.hash(x.password,12);const r=await pool.query('insert into users(email,password_hash,full_name,country,email_verified) values($1,$2,$3,$4,false) returning id,email,full_name,country,role,kyc_status,email_verified',[x.email.toLowerCase(),hash,x.fullName,x.country]);const code=makeCode();
+ try{
+   const hash=await bcrypt.hash(x.password,12);
+   const r=await pool.query('insert into users(email,password_hash,full_name,country,email_verified) values($1,$2,$3,$4,false) returning id,email,full_name,country,role,kyc_status,email_verified',[x.email.toLowerCase(),hash,x.fullName,x.country]);
+   const code=makeCode();
    await pool.query("insert into verification_tokens(user_id,channel,token_hash,expires_at) values($1,'email',$2,now()+interval '15 minutes')",[r.rows[0].id,hashToken(code)]);
-   const delivery=await sendVerificationEmail(r.rows[0].email,code);
-   res.status(201).json({user:r.rows[0],token:sign(r.rows[0]),email_verification_required:true,development_code:delivery.development?code:undefined,message:'Account created. Verify your email before using financial features.'})}
- catch{res.status(409).json({error:'Email is already registered'})}
+   let delivery;
+   try{delivery=await sendVerificationEmail(r.rows[0].email,code)}
+   catch{await pool.query('delete from verification_tokens where user_id=$1 and channel=\'email\' and used_at is null',[r.rows[0].id]);await pool.query('delete from users where id=$1',[r.rows[0].id]);return res.status(503).json({error:'Email delivery is not configured yet. Connect the email provider before creating accounts.'})}
+   res.status(201).json({user:r.rows[0],token:sign(r.rows[0]),email_verification_required:true,development_code:delivery.development?code:undefined,message:'Account created. Verify your email before using financial features.'})
+ }catch(e){if(e?.code==='23505')return res.status(409).json({error:'Email is already registered'});console.error(e);res.status(500).json({error:'Could not create account'})}
 });
 
 app.post('/api/auth/resend-verification',auth,async(req,res)=>{
@@ -86,7 +91,18 @@ app.post('/api/auth/login',async(req,res)=>{
 app.get('/api/me',auth,async(req,res)=>{const r=await pool.query('select id,email,full_name,country,role,kyc_status,kyc_reference,created_at from users where id=$1',[req.user.sub]);res.json(r.rows[0]||null)});
 
 app.post('/api/kyc/session',auth,verifiedAccount,async(req,res)=>{
- const ref='KYC-'+crypto.randomUUID();await pool.query('update users set kyc_reference=$1,updated_at=now() where id=$2',[ref,req.user.sub]);await audit(req,'kyc.session.created',{provider:process.env.KYC_PROVIDER||'stub'});res.status(201).json({status:'pending',reference:ref,provider:process.env.KYC_PROVIDER||'stub',message:'Connect an approved KYC provider before production activation.'})
+ const p=z.object({documentType:z.enum(['BW_OMANG','BW_PASSPORT','SZ_ID','SZ_PASSPORT'])}).safeParse(req.body);
+ if(!p.success)return res.status(400).json({error:'Select a valid identity document type'});
+ const ref='KYC-'+crypto.randomUUID();
+ const provider=process.env.KYC_PROVIDER||'stub';
+ const r=await pool.query("insert into kyc_sessions(user_id,provider,reference,status,document_type) values($1,$2,$3,'pending',$4) returning id,reference,status,document_type,created_at",[req.user.sub,provider,ref,p.data.documentType]);
+ await pool.query('update users set kyc_reference=$1,kyc_status=\'in_progress\',updated_at=now() where id=$2',[ref,req.user.sub]);
+ await audit(req,'kyc.session.created',{provider,document_type:p.data.documentType});
+ res.status(201).json({status:'pending',reference:ref,session_id:r.rows[0].id,document_type:p.data.documentType,provider,message:provider==='stub'?'KYC provider is still in stub mode. Connect an approved provider before production activation.':'KYC session created.'});
+});
+app.get('/api/kyc/status',auth,verifiedAccount,async(req,res)=>{
+ const r=await pool.query("select u.kyc_status,u.kyc_reference,k.provider,k.status,k.document_type,k.document_verified,k.face_verified,k.liveness_verified,k.aml_screened,k.pep_screened,k.duplicate_face_checked,k.created_at,k.updated_at from users u left join lateral (select * from kyc_sessions where user_id=u.id order by created_at desc limit 1) k on true where u.id=$1",[req.user.sub]);
+ res.json(r.rows[0]||null);
 });
 
 app.get('/api/transactions',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
