@@ -1,6 +1,8 @@
-import smileIdentityCore from 'smile-identity-core';
-
-const {WebApi, Signature}=smileIdentityCore;
+let sdkPromise;
+async function sdk(){
+  sdkPromise ||= import('smile-identity-core');
+  return sdkPromise;
+}
 
 export function kycConfigured(){
   return Boolean(process.env.SMILE_PARTNER_ID && process.env.SMILE_API_KEY);
@@ -10,7 +12,7 @@ function requireConfig(){
   if(!kycConfigured()) throw new Error('Smile ID is not configured');
 }
 
-function webApi(){
+function webApi(WebApi){
   requireConfig();
   const partnerId=String(process.env.SMILE_PARTNER_ID);
   const callback=process.env.KYC_CALLBACK_URL;
@@ -21,7 +23,8 @@ function webApi(){
 }
 
 export async function createHostedKycSession({userId,jobId,product='enhanced_kyc'}){
-  const connection=webApi();
+  const {WebApi}=await sdk();
+  const connection=webApi(WebApi);
   return connection.get_web_token({
     user_id:userId,
     job_id:jobId,
@@ -33,7 +36,7 @@ export async function createHostedKycSession({userId,jobId,product='enhanced_kyc
 export function confirmCallbackSignature(timestamp,signature){
   requireConfig();
   if(!timestamp || !signature) return false;
-  const connection=new Signature(String(process.env.SMILE_PARTNER_ID),process.env.SMILE_API_KEY);
+  const connection=new (await sdk()).Signature(String(process.env.SMILE_PARTNER_ID),process.env.SMILE_API_KEY);
   return connection.confirm_signature(timestamp,signature);
 }
 
