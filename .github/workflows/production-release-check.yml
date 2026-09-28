@@ -1,0 +1,55 @@
+name: Production release check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install root dependencies
+        run: npm install
+      - name: Install backend dependencies
+        run: npm --prefix backend install
+      - name: JavaScript syntax checks
+        run: |
+          node --check backend/src/server.js
+          node --check backend/src/migrate.js
+          node --check backend/src/reconcile.js
+          node --check backend/src/smile-id.js
+      - name: Frontend smoke checks
+        shell: bash
+        run: |
+          test -f web/platform.html
+          test -f web/customer.html
+          test -f web/owner.html
+          test -f web/compliance.html
+          test -f web/testnet-config.js
+          test -f web/mainnet-config.template.js
+          grep -q 'Public Global Stellar Network ; September 2015' web/mainnet-config.template.js
+          grep -q 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN' web/mainnet-config.template.js
+          grep -q 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75' web/mainnet-config.template.js
+      - name: Mainnet safety checks
+        shell: bash
+        run: |
+          test -f .github/workflows/deploy-mainnet.yml
+          grep -q 'DEPLOY-MAINNET' .github/workflows/deploy-mainnet.yml
+          grep -q 'environment: mainnet-production' .github/workflows/deploy-mainnet.yml
+          if grep -RInE 'SECRET|PRIVATE KEY|SECRET_KEY' web --exclude='mainnet-config.template.js' >/tmp/web-secret-scan.txt; then
+            cat /tmp/web-secret-scan.txt
+            exit 1
+          fi
+      - name: Dependency audit
+        run: |
+          npm audit --audit-level=high
+          npm --prefix backend audit --audit-level=high
