@@ -8,6 +8,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import {Pool} from 'pg';
 import {z} from 'zod';
+import {createHostedKycSession,confirmCallbackSignature,normalizeKycDecision,kycConfigured} from './smile-id.js';
 import {execFile} from 'child_process';
 import {promisify} from 'util';
 const execFileAsync=promisify(execFile);
@@ -27,6 +28,7 @@ if(process.env.NODE_ENV==='production' && STELLAR_NETWORK==='mainnet'){
  const required=[['RESEND_API_KEY',process.env.RESEND_API_KEY],['EMAIL_FROM',process.env.EMAIL_FROM],['SMS_PROVIDER_URL',process.env.SMS_PROVIDER_URL],['SMS_PROVIDER_API_KEY',process.env.SMS_PROVIDER_API_KEY],['RECONCILE_SECRET',process.env.RECONCILE_SECRET]];
  const missing=required.filter(([,v])=>!v).map(([k])=>k);
  if((process.env.KYC_PROVIDER||'stub').toLowerCase()==='stub') missing.push('KYC_PROVIDER(non-stub)');
+ if((process.env.KYC_PROVIDER||'stub').toLowerCase()==='smile'){if(!process.env.SMILE_PARTNER_ID) missing.push('SMILE_PARTNER_ID');if(!process.env.SMILE_API_KEY) missing.push('SMILE_API_KEY');if(!process.env.KYC_CALLBACK_URL) missing.push('KYC_CALLBACK_URL');}
  if(missing.length) throw new Error('Mainnet production configuration incomplete: '+missing.join(', '));
 }
 app.use(cors({origin:(origin,cb)=>{if(!origin||allowedOrigins.includes(origin))return cb(null,true);cb(new Error('Origin not allowed'));},credentials:true}));
@@ -172,13 +174,47 @@ app.get('/api/me',auth,async(req,res)=>{const r=await pool.query('select id,emai
 app.post('/api/kyc/session',auth,verifiedAccount,async(req,res)=>{
  const p=z.object({documentType:z.enum(['BW_OMANG','BW_PASSPORT','SZ_ID','SZ_PASSPORT'])}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Select a valid identity document type'});
+ const provider=(process.env.KYC_PROVIDER||'stub').toLowerCase();
  const ref='KYC-'+crypto.randomUUID();
- const provider=process.env.KYC_PROVIDER||'stub';
- const r=await pool.query("insert into kyc_sessions(user_id,provider,reference,status,document_type) values($1,$2,$3,'pending',$4) returning id,reference,status,document_type,created_at",[req.user.sub,provider,ref,p.data.documentType]);
- await pool.query('update users set kyc_reference=$1,kyc_status=\'in_progress\',updated_at=now() where id=$2',[ref,req.user.sub]);
- await audit(req,'kyc.session.created',{provider,document_type:p.data.documentType});
- res.status(201).json({status:'pending',reference:ref,session_id:r.rows[0].id,document_type:p.data.documentType,provider,message:provider==='stub'?'KYC provider is still in stub mode. Connect an approved provider before production activation.':'KYC session created.'});
+ try{
+   if(provider==='stub'){
+     const r=await pool.query("insert into kyc_sessions(user_id,provider,reference,status,document_type) values($1,$2,$3,'pending',$4) returning id,reference,status,document_type,created_at",[req.user.sub,provider,ref,p.data.documentType]);
+     await pool.query("update users set kyc_reference=$1,kyc_status='in_progress',updated_at=now() where id=$2",[ref,req.user.sub]);
+     await audit(req,'kyc.session.created',{provider,document_type:p.data.documentType});
+     return res.status(201).json({status:'pending',reference:ref,session_id:r.rows[0].id,document_type:p.data.documentType,provider,message:'KYC provider is still in stub mode. Connect an approved provider before production activation.'});
+   }
+   if(provider!=='smile') return res.status(503).json({error:'Unsupported KYC provider'});
+   if(!kycConfigured()) return res.status(503).json({error:'Smile ID KYC is not configured on the API yet'});
+   const r=await pool.query("insert into kyc_sessions(user_id,provider,reference,status,document_type,result) values($1,'smile',$2,'pending',$3,$4) returning id,reference,status,document_type,created_at",[req.user.sub,ref,p.data.documentType,JSON.stringify({document_type:p.data.documentType})]);
+   const token=await createHostedKycSession({userId:req.user.sub,jobId:ref,product:process.env.SMILE_KYC_PRODUCT||'enhanced_kyc'});
+   await pool.query("update kyc_sessions set result=result||$1::jsonb,updated_at=now() where id=$2",[JSON.stringify({provider:'smile',job_id:ref}),r.rows[0].id]);
+   await pool.query("update users set kyc_reference=$1,kyc_status='in_progress',updated_at=now() where id=$2",[ref,req.user.sub]);
+   await audit(req,'kyc.session.created',{provider:'smile',document_type:p.data.documentType,job_id:ref});
+   return res.status(201).json({status:'pending',reference:ref,session_id:r.rows[0].id,document_type:p.data.documentType,provider:'smile',product:process.env.SMILE_KYC_PRODUCT||'enhanced_kyc',token:token.token||token});
+ }catch(e){console.error('KYC session creation failed',e);return res.status(502).json({error:'Could not start identity verification with the KYC provider'});}
 });
+
+app.post('/api/kyc/callback',async(req,res)=>{
+ try{
+   const payload=req.body||{};
+   const timestamp=payload.timestamp||req.get('x-smile-timestamp');
+   const signature=payload.signature||req.get('x-smile-signature');
+   if(!confirmCallbackSignature(timestamp,signature)) return res.status(401).json({error:'Invalid KYC callback signature'});
+   const partner=payload.PartnerParams||payload.partner_params||{};
+   const jobId=partner.job_id||payload.job_id||payload.JobID;
+   if(!jobId)return res.status(400).json({error:'KYC callback is missing job_id'});
+   const d=normalizeKycDecision(payload);
+   const status=d.status==='verified'?'verified':d.status==='rejected'?'rejected':'pending';
+   const session=await pool.query("select id,user_id from kyc_sessions where provider='smile' and reference=$1 order by created_at desc limit 1",[jobId]);
+   if(!session.rowCount)return res.status(404).json({error:'KYC session not found'});
+   await pool.query("update kyc_sessions set status=$1,document_verified=$2,face_verified=$3,liveness_verified=$4,aml_screened=$5,pep_screened=$6,duplicate_face_checked=$7,result=result||$8::jsonb,updated_at=now() where id=$9",[status,status==='verified',status==='verified',status==='verified',status==='verified',false,false,JSON.stringify({result_code:d.resultCode,result_text:d.resultText,final:d.final,smile_job_id:d.smileJobId,callback_received_at:new Date().toISOString()}),session.rows[0].id]);
+   if(status==='verified') await pool.query("update users set kyc_status='verified',updated_at=now() where id=$1",[session.rows[0].user_id]);
+   else if(status==='rejected') await pool.query("update users set kyc_status='rejected',updated_at=now() where id=$1",[session.rows[0].user_id]);
+   await pool.query("insert into audit_log(user_id,action,metadata) values($1,$2,$3)",[session.rows[0].user_id,'kyc.provider.callback',{provider:'smile',job_id:jobId,status,result_code:d.resultCode}]);
+   return res.json({ok:true,status});
+ }catch(e){console.error('KYC callback failed',e);return res.status(500).json({error:'KYC callback processing failed'});}
+});
+
 app.get('/api/kyc/status',auth,verifiedAccount,async(req,res)=>{
  const r=await pool.query("select u.kyc_status,u.kyc_reference,k.provider,k.status,k.document_type,k.document_verified,k.face_verified,k.liveness_verified,k.aml_screened,k.pep_screened,k.duplicate_face_checked,k.created_at,k.updated_at from users u left join lateral (select * from kyc_sessions where user_id=u.id order by created_at desc limit 1) k on true where u.id=$1",[req.user.sub]);
  res.json(r.rows[0]||null);
