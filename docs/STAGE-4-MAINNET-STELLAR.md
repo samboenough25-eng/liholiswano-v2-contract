@@ -21,7 +21,7 @@ Stellar does not provide an SDF-hosted public Mainnet RPC endpoint. A production
 
 Current Stellar documentation lists Mainnet providers including Gateway, sorobanrpc.com, Nodies, OnFinality, Lightsail Network and Ankr.
 
-The repository intentionally does NOT select a provider by itself. The production provider must be selected based on reliability, rate limits, SLA, geographic/network requirements and cost.
+The repository now uses Gateway's documented Mainnet RPC endpoint as the provisional endpoint in the isolated Mainnet template. Before Stage 6 production activation, its connectivity, rate limits, reliability and commercial terms must be tested and accepted; the endpoint can be replaced without touching Testnet.
 
 ## USDC — independently verified
 
