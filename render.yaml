@@ -22,7 +22,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: CORS_ORIGIN
-        value: https://samboenough25-eng.github.io
+        value: https://liholiswano-web.onrender.com,https://samboenough25-eng.github.io
       - key: STELLAR_NETWORK
         value: testnet
       - key: STELLAR_RPC_URL
