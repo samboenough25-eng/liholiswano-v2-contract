@@ -199,7 +199,7 @@ app.post('/api/kyc/callback',async(req,res)=>{
    const payload=req.body||{};
    const timestamp=payload.timestamp||req.get('x-smile-timestamp');
    const signature=payload.signature||req.get('x-smile-signature');
-   if(!confirmCallbackSignature(timestamp,signature)) return res.status(401).json({error:'Invalid KYC callback signature'});
+   if(!(await confirmCallbackSignature(timestamp,signature))) return res.status(401).json({error:'Invalid KYC callback signature'});
    const partner=payload.PartnerParams||payload.partner_params||{};
    const jobId=partner.job_id||payload.job_id||payload.JobID;
    if(!jobId)return res.status(400).json({error:'KYC callback is missing job_id'});
