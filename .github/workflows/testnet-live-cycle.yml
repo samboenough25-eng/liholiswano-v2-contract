@@ -18,14 +18,14 @@ on:
       contract_id:
         description: "Deployed Liholiswano contract ID"
         required: true
-        default: "CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY"
+        default: "CBSBXWQFE3SOT3BOPVZ2IHK32PBUP5BFRHJLI6R2WH6WIQJQLV4WAYHO"
 
 jobs:
   cycle:
     if: github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[run-live-cycle]') && !contains(github.event.head_commit.message, '[deploy-testnet]'))
     runs-on: ubuntu-latest
     env:
-      CID: ${{ inputs.contract_id || 'CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY' }}
+      CID: ${{ inputs.contract_id || 'CBSBXWQFE3SOT3BOPVZ2IHK32PBUP5BFRHJLI6R2WH6WIQJQLV4WAYHO' }}
       NET: testnet
     steps:
       - name: Install system libraries the Stellar CLI needs
