@@ -25,7 +25,12 @@ app.use(helmet());
 const allowedOrigins=[...(process.env.CORS_ORIGIN||'').split(',').map(s=>s.trim()).filter(Boolean),'https://liholiswano-web.onrender.com','https://samboenough25-eng.github.io'].filter((v,i,a)=>a.indexOf(v)===i);
 if(process.env.NODE_ENV==='production' && !allowedOrigins.length) throw new Error('CORS_ORIGIN is required in production');
 if(process.env.NODE_ENV==='production' && STELLAR_NETWORK==='mainnet'){
- const required=[['RESEND_API_KEY',process.env.RESEND_API_KEY],['EMAIL_FROM',process.env.EMAIL_FROM],['SMS_PROVIDER_URL',process.env.SMS_PROVIDER_URL],['SMS_PROVIDER_API_KEY',process.env.SMS_PROVIDER_API_KEY],['RECONCILE_SECRET',process.env.RECONCILE_SECRET]];
+ const required=[['RESEND_API_KEY',process.env.RESEND_API_KEY],['EMAIL_FROM',process.env.EMAIL_FROM],['RECONCILE_SECRET',process.env.RECONCILE_SECRET]];
+ if((process.env.SMS_PROVIDER||'generic').toLowerCase()==='africastalking'){
+   required.push(['AT_USERNAME',process.env.AT_USERNAME],['AT_API_KEY',process.env.AT_API_KEY],['AT_SENDER_ID',process.env.AT_SENDER_ID]);
+ }else{
+   required.push(['SMS_PROVIDER_URL',process.env.SMS_PROVIDER_URL],['SMS_PROVIDER_API_KEY',process.env.SMS_PROVIDER_API_KEY]);
+ }
  const missing=required.filter(([,v])=>!v).map(([k])=>k);
  if((process.env.KYC_PROVIDER||'stub').toLowerCase()==='stub') missing.push('KYC_PROVIDER(non-stub)');
  if((process.env.KYC_PROVIDER||'stub').toLowerCase()==='smile'){if(!process.env.SMILE_PARTNER_ID) missing.push('SMILE_PARTNER_ID');if(!process.env.SMILE_API_KEY) missing.push('SMILE_API_KEY');if(!process.env.KYC_CALLBACK_URL) missing.push('KYC_CALLBACK_URL');}
@@ -47,6 +52,7 @@ const hashToken=v=>crypto.createHash('sha256').update(v).digest('hex');
 const makeCode=()=>String(crypto.randomInt(100000,1000000));
 async function stellarTransactionStatus(hash){const r=await fetch(STELLAR_RPC_URL,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:Date.now(),method:'getTransaction',params:{hash}})});if(!r.ok)throw new Error('Stellar RPC HTTP '+r.status);const j=await r.json();if(j.error)throw new Error(j.error.message||'Stellar RPC error');return j.result;}
 const sendVerificationEmail=async(to,code)=>{
+
  const key=process.env.RESEND_API_KEY;
  const from=process.env.EMAIL_FROM;
  if(!key||!from){
@@ -58,6 +64,36 @@ const sendVerificationEmail=async(to,code)=>{
  if(!r.ok)throw new Error('Email delivery failed');
  return {delivered:true};
 };
+
+const sendSms=async(to,message)=>{
+ const provider=(process.env.SMS_PROVIDER||'generic').toLowerCase();
+ if(provider==='africastalking'){
+   const key=process.env.AT_API_KEY,username=process.env.AT_USERNAME;
+   if(!key||!username) throw new Error('Africa\'s Talking SMS is not configured');
+   const url=process.env.AT_SMS_URL||'https://api.africastalking.com/version1/messaging';
+   const body=new URLSearchParams({username,to,message});
+   if(process.env.AT_SENDER_ID) body.set('from',process.env.AT_SENDER_ID);
+   const r=await fetch(url,{method:'POST',headers:{apiKey:key,'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body});
+   const data=await r.json().catch(()=>({}));
+   if(!r.ok) throw new Error('SMS provider HTTP '+r.status);
+   const recipient=data?.SMSMessageData?.Recipients?.[0];
+   if(!recipient || !['100','101','102'].includes(String(recipient.statusCode))) throw new Error('SMS provider rejected the message');
+   return {accepted:true,messageId:recipient.messageId||null,statusCode:recipient.statusCode};
+ }
+ const url=process.env.SMS_PROVIDER_URL,key=process.env.SMS_PROVIDER_API_KEY;
+ if(!url||!key) throw new Error('SMS provider is not configured');
+ const r=await fetch(url,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({to,message})});
+ if(!r.ok)throw new Error('SMS delivery failed');
+ return {accepted:true};
+};
+
+app.post('/api/sms/delivery-report',async(req,res)=>{
+ try{
+   const p=req.body||{};
+   console.log('SMS delivery report',JSON.stringify({id:p.id||p.messageId||null,status:p.status||p.Status||null,to:p.phoneNumber||p.to||null,provider:process.env.SMS_PROVIDER||'generic'}));
+   res.sendStatus(200);
+ }catch(e){res.sendStatus(200);}
+});
 
 app.get('/health',async(_,res)=>{try{await pool.query('select 1');res.json({ok:true,service:'liholiswano-api',network:process.env.STELLAR_NETWORK||'testnet'})}catch{res.status(503).json({ok:false})}});
 
@@ -105,11 +141,10 @@ app.post('/api/auth/set-phone',auth,verifiedAccount,async(req,res)=>{
  await pool.query("update verification_tokens set used_at=now() where user_id=$1 and channel='phone' and used_at is null",[req.user.sub]);
  const code=makeCode();
  await pool.query("insert into verification_tokens(user_id,channel,token_hash,expires_at) values($1,'phone',$2,now()+interval '15 minutes')",[req.user.sub,hashToken(code)]);
- const url=process.env.SMS_PROVIDER_URL,key=process.env.SMS_PROVIDER_API_KEY;
- if(!url||!key)return res.status(503).json({error:'SMS provider is not configured yet'});
- const rr=await fetch(url,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({to:p.data.phone,message:'Your Liholiswano phone verification code is '+code+'. It expires in 15 minutes.'})});
- if(!rr.ok)return res.status(503).json({error:'SMS delivery failed'});
- res.json({message:'Verification code sent.'});
+ try{
+   await sendSms(p.data.phone,'Your Liholiswano phone verification code is '+code+'. It expires in 15 minutes.');
+   res.json({message:'Verification code sent.'});
+ }catch(e){console.error('SMS delivery failed',e);res.status(503).json({error:'SMS delivery is not configured or could not be sent'});}
 });
 app.post('/api/auth/verify-phone',auth,verifiedAccount,codeLimiter,async(req,res)=>{
  const p=z.object({code:z.string().regex(/^\d{6}$/)}).safeParse(req.body);
