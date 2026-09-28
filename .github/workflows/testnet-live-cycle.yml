@@ -174,3 +174,4 @@ jobs:
           cat "$GITHUB_STEP_SUMMARY" | tail -8
 
 # [run-live-cycle] verify the currently deployed Testnet contract after configuration fixes
+# Existing-contract acceptance cycle only; do not deploy a new contract.
