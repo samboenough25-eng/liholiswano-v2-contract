@@ -5,7 +5,7 @@ services:
     plan: free
     region: frankfurt
     rootDir: ""
-    buildCommand: npm install
+    buildCommand: npm install && npm --prefix backend install
     startCommand: npm start
     healthCheckPath: /health
     envVars:
