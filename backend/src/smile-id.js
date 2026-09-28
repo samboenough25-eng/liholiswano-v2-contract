@@ -33,7 +33,7 @@ export async function createHostedKycSession({userId,jobId,product='enhanced_kyc
   });
 }
 
-export function confirmCallbackSignature(timestamp,signature){
+export async function confirmCallbackSignature(timestamp,signature){
   requireConfig();
   if(!timestamp || !signature) return false;
   const connection=new (await sdk()).Signature(String(process.env.SMILE_PARTNER_ID),process.env.SMILE_API_KEY);
