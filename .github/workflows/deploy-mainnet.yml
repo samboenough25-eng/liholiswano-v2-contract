@@ -48,11 +48,11 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$RPC_URL"
-          if [ "\${#ADMIN}" -ne 56 ] || [[ "$ADMIN" != G* ]]; then
+          if [ "$(printf %s "$ADMIN" | wc -c)" -ne 56 ] || [[ "$ADMIN" != G* ]]; then
             echo "::error::Protocol admin must be a 56-character G... address."
             exit 1
           fi
-          if [ "\${#USDC_SAC}" -ne 56 ] || [[ "$USDC_SAC" != C* ]]; then
+          if [ "$(printf %s "$USDC_SAC" | wc -c)" -ne 56 ] || [[ "$USDC_SAC" != C* ]]; then
             echo "::error::USDC SAC must be a 56-character C... contract address."
             exit 1
           fi
