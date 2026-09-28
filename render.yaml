@@ -36,13 +36,6 @@ services:
       - key: RECONCILE_SECRET
         generateValue: true
 
-databases:
-  - name: liholiswano-db
-    plan: free
-    region: frankfurt
-    databaseName: liholiswano
-    postgresMajorVersion: "17"
-
   - type: web
     runtime: static
     name: liholiswano-web
@@ -62,3 +55,10 @@ databases:
         path: /*
         name: Referrer-Policy
         value: strict-origin-when-cross-origin
+
+databases:
+  - name: liholiswano-db
+    plan: free
+    region: frankfurt
+    databaseName: liholiswano
+    postgresMajorVersion: "17"
