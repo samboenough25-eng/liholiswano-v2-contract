@@ -20,12 +20,26 @@ if(process.env.NODE_ENV==='production' && !process.env.JWT_SECRET) throw new Err
 if(!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
 const STELLAR_NETWORK=process.env.STELLAR_NETWORK||'testnet';
 const STELLAR_RPC_URL=process.env.STELLAR_RPC_URL||'https://soroban-testnet.stellar.org';
+const STELLAR_HORIZON_URL=process.env.STELLAR_HORIZON_URL||(STELLAR_NETWORK==='mainnet'?'https://horizon.stellar.org':'https://horizon-testnet.stellar.org');
+const MAINNET_USDC_ISSUER=process.env.MAINNET_USDC_ISSUER||'';
+const MAINNET_USDC_SAC=process.env.MAINNET_USDC_SAC||'';
+const stellarContractId=process.env.STELLAR_CONTRACT_ID||'';
+
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false});
 app.use(helmet());
 const allowedOrigins=[...(process.env.CORS_ORIGIN||'').split(',').map(s=>s.trim()).filter(Boolean),'https://liholiswano-web.onrender.com','https://samboenough25-eng.github.io'].filter((v,i,a)=>a.indexOf(v)===i);
 if(process.env.NODE_ENV==='production' && !allowedOrigins.length) throw new Error('CORS_ORIGIN is required in production');
 if(process.env.NODE_ENV==='production' && STELLAR_NETWORK==='mainnet'){
- const required=[['RESEND_API_KEY',process.env.RESEND_API_KEY],['EMAIL_FROM',process.env.EMAIL_FROM],['RECONCILE_SECRET',process.env.RECONCILE_SECRET]];
+ const required=[
+   ['STELLAR_CONTRACT_ID',stellarContractId],
+   ['STELLAR_RPC_URL',STELLAR_RPC_URL],
+   ['STELLAR_HORIZON_URL',STELLAR_HORIZON_URL],
+   ['MAINNET_USDC_ISSUER',MAINNET_USDC_ISSUER],
+   ['MAINNET_USDC_SAC',MAINNET_USDC_SAC],
+   ['RESEND_API_KEY',process.env.RESEND_API_KEY],
+   ['EMAIL_FROM',process.env.EMAIL_FROM],
+   ['RECONCILE_SECRET',process.env.RECONCILE_SECRET]
+ ];
  if((process.env.SMS_PROVIDER||'generic').toLowerCase()==='africastalking'){
    required.push(['AT_USERNAME',process.env.AT_USERNAME],['AT_API_KEY',process.env.AT_API_KEY],['AT_SENDER_ID',process.env.AT_SENDER_ID]);
  }else{
