@@ -33,11 +33,12 @@ This document is the release gate for moving Liholiswano from the verified Stell
 - [ ] Mainnet contract read/invoke smoke tests pass.
 
 ### 2. Mainnet Stellar configuration
-- [ ] Mainnet network selected only after all other release gates pass.
-- [ ] Mainnet USDC issuer verified from an authoritative current source.
-- [ ] Mainnet USDC Stellar Asset Contract address resolved for that issuer.
+- [x] Mainnet network values/passphrase verified from current Stellar documentation.
+- [x] Mainnet USDC issuer verified from current authoritative Stellar/Circle documentation.
+- [x] Mainnet USDC Stellar Asset Contract address verified.
 - [ ] Any other supported asset issuer/contract address verified.
 - [ ] Mainnet treasury public key created and independently verified.
+- [ ] Production Mainnet Soroban RPC provider selected and tested.
 - [ ] Mainnet treasury signing process tested.
 - [ ] No Testnet asset issuer, RPC URL, passphrase, contract ID, or treasury address remains in production configuration.
 
