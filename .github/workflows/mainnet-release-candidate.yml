@@ -1,0 +1,45 @@
+name: Mainnet release candidate build (NO DEPLOYMENT)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.79.0 with WASM target
+        uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v27.0.0
+
+      - name: Run locked contract tests
+        working-directory: contract-v2
+        run: cargo test --locked
+
+      - name: Build release WASM
+        working-directory: contract-v2
+        run: stellar contract build
+
+      - name: Verify and fingerprint WASM
+        working-directory: contract-v2
+        run: |
+          set -euo pipefail
+          WASM=target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm
+          test -f "$WASM"
+          sha256sum "$WASM"
+          stat -c 'WASM_SIZE_BYTES=%s' "$WASM"
+
+      - name: Confirm this job cannot deploy
+        run: |
+          echo "PASS: release-candidate build only"
+          echo "PASS: no Mainnet RPC is contacted"
+          echo "PASS: no contract deployment or initialization occurs"
