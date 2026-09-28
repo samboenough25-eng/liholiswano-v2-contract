@@ -1,0 +1,179 @@
+name: Mainnet contract deployment (MANUAL + PROTECTED)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rpc_url:
+        description: "Approved Mainnet Soroban RPC URL"
+        required: true
+        type: string
+      expected_protocol_admin:
+        description: "Mainnet protocol-admin G... address"
+        required: true
+        type: string
+      expected_usdc_sac:
+        description: "Verified Mainnet USDC SAC C... address"
+        required: true
+        type: string
+      confirm_mainnet:
+        description: "Type DEPLOY-MAINNET to permit the irreversible deployment"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: ${{ inputs.confirm_mainnet == 'DEPLOY-MAINNET' }}
+    runs-on: ubuntu-latest
+    environment: mainnet-production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.79.0 with WASM target
+        uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v27.1.0
+
+      - name: Validate Mainnet inputs
+        env:
+          RPC_URL: ${{ inputs.rpc_url }}
+          ADMIN: ${{ inputs.expected_protocol_admin }}
+          USDC_SAC: ${{ inputs.expected_usdc_sac }}
+        run: |
+          set -euo pipefail
+          test -n "$RPC_URL"
+          if [ "\${#ADMIN}" -ne 56 ] || [[ "$ADMIN" != G* ]]; then
+            echo "::error::Protocol admin must be a 56-character G... address."
+            exit 1
+          fi
+          if [ "\${#USDC_SAC}" -ne 56 ] || [[ "$USDC_SAC" != C* ]]; then
+            echo "::error::USDC SAC must be a 56-character C... contract address."
+            exit 1
+          fi
+
+      - name: Run locked tests
+        working-directory: contract-v2
+        run: cargo test --locked
+
+      - name: Build release WASM
+        working-directory: contract-v2
+        run: stellar contract build
+
+      - name: Fingerprint release WASM
+        working-directory: contract-v2
+        run: |
+          set -euo pipefail
+          WASM=target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm
+          test -f "$WASM"
+          sha256sum "$WASM"
+          stat -c 'WASM_SIZE_BYTES=%s' "$WASM"
+
+      - name: Import Mainnet deployer identity
+        env:
+          STELLAR_MAINNET_DEPLOYER_SECRET: ${{ secrets.STELLAR_MAINNET_DEPLOYER_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$STELLAR_MAINNET_DEPLOYER_SECRET"
+          stellar keys add mainnet-deployer --secret-key "$STELLAR_MAINNET_DEPLOYER_SECRET"
+          ADDRESS="$(stellar keys address mainnet-deployer)"
+          echo "DEPLOYER_PUBLIC_KEY=$ADDRESS" >> "$GITHUB_ENV"
+
+      - name: Verify deployer equals approved protocol administrator
+        env:
+          EXPECTED_ADMIN: ${{ inputs.expected_protocol_admin }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOYER_PUBLIC_KEY" = "$EXPECTED_ADMIN"
+
+      - name: Verify Mainnet USDC SAC against asset definition
+        env:
+          RPC_URL: ${{ inputs.rpc_url }}
+          EXPECTED_SAC: ${{ inputs.expected_usdc_sac }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SAC="$(stellar contract id asset \
+            --asset 'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN' \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase 'Public Global Stellar Network ; September 2015')"
+          echo "Resolved Mainnet USDC SAC: $ACTUAL_SAC"
+          test "$ACTUAL_SAC" = "$EXPECTED_SAC"
+
+      - name: Deploy contract to Mainnet
+        env:
+          RPC_URL: ${{ inputs.rpc_url }}
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="$(stellar contract deploy \
+            --wasm contract-v2/target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm \
+            --source-account mainnet-deployer \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase 'Public Global Stellar Network ; September 2015')"
+          echo "CONTRACT_ID=$CONTRACT_ID" >> "$GITHUB_ENV"
+          echo "Mainnet contract ID: $CONTRACT_ID"
+
+      - name: Initialize protocol administrator
+        env:
+          RPC_URL: ${{ inputs.rpc_url }}
+          ADMIN: ${{ inputs.expected_protocol_admin }}
+        run: |
+          set -euo pipefail
+          stellar contract invoke \
+            --id "$CONTRACT_ID" \
+            --source-account mainnet-deployer \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase 'Public Global Stellar Network ; September 2015' \
+            -- \
+            initialize \
+            --protocol_admin "$ADMIN"
+
+      - name: Add verified Mainnet USDC SAC to allowlist
+        env:
+          RPC_URL: ${{ inputs.rpc_url }}
+          USDC_SAC: ${{ inputs.expected_usdc_sac }}
+        run: |
+          set -euo pipefail
+          stellar contract invoke \
+            --id "$CONTRACT_ID" \
+            --source-account mainnet-deployer \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase 'Public Global Stellar Network ; September 2015' \
+            -- \
+            add_approved_token \
+            --protocol_admin "$DEPLOYER_PUBLIC_KEY" \
+            --token "$USDC_SAC"
+
+      - name: Verify deployed contract and allowlist
+        env:
+          RPC_URL: ${{ inputs.rpc_url }}
+          USDC_SAC: ${{ inputs.expected_usdc_sac }}
+        run: |
+          set -euo pipefail
+          echo "Mainnet contract: $CONTRACT_ID"
+          echo "Protocol admin: $DEPLOYER_PUBLIC_KEY"
+          echo "USDC SAC: $USDC_SAC"
+          stellar contract invoke \
+            --id "$CONTRACT_ID" \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase 'Public Global Stellar Network ; September 2015' \
+            -- \
+            list_approved_tokens
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "## Liholiswano Mainnet Contract Deployment"
+            echo ""
+            echo "- Contract ID: \`$CONTRACT_ID\`"
+            echo "- Protocol admin: \`$DEPLOYER_PUBLIC_KEY\`"
+            echo "- Network: Stellar Mainnet"
+            echo "- USDC SAC: \`${{ inputs.expected_usdc_sac }}\`"
+            echo "- RPC: configured by workflow input"
+            echo ""
+            echo "Private signing material was not printed."
+          } >> "$GITHUB_STEP_SUMMARY"
