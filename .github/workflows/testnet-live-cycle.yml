@@ -152,3 +152,5 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY" | tail -8
+
+# [run-live-cycle] verify the currently deployed Testnet contract after configuration fixes
