@@ -63,17 +63,37 @@ jobs:
       - name: Create throwaway accounts and a test token (LIHO)
         run: |
           set -euo pipefail
-          for n in issuer m1 m2 m3; do stellar keys generate $n --network $NET --fund; done
+
+          # Testnet Friendbot can be intermittent/rate-limited. Generate first,
+          # then retry funding so one transient faucet failure does not abort
+          # the entire live-cycle.
+          for n in issuer m1 m2 m3; do
+            stellar keys generate "$n" --network "$NET"
+            funded=false
+            for attempt in 1 2 3 4 5; do
+              if stellar keys fund "$n" --network "$NET"; then
+                funded=true
+                break
+              fi
+              echo "Funding $n failed on attempt $attempt; retrying..."
+              sleep 4
+            done
+            if [ "$funded" != "true" ]; then
+              echo "::error::Unable to fund Testnet account $n after 5 attempts"
+              exit 1
+            fi
+          done
+
           ASSET="LIHO:$(stellar keys address issuer)"
-          stellar contract asset deploy --asset "$ASSET" --source-account issuer --network $NET
-          TOKEN=$(stellar contract id asset --asset "$ASSET" --network $NET)
+          stellar contract asset deploy --asset "$ASSET" --source-account issuer --network "$NET"
+          TOKEN=$(stellar contract id asset --asset "$ASSET" --network "$NET")
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
           for m in m1 m2 m3; do
-            stellar tx new change-trust --source-account $m --line "$ASSET" --network $NET
+            stellar tx new change-trust --source-account "$m" --line "$ASSET" --network "$NET"
             stellar tx new payment --source-account issuer \
-              --destination "$(stellar keys address $m)" --asset "$ASSET" \
-              --amount 100000000 --network $NET
+              --destination "$(stellar keys address "$m")" --asset "$ASSET" \
+              --amount 100000000 --network "$NET"
           done
           echo "Test token contract: $TOKEN"
 
