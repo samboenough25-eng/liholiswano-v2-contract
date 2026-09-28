@@ -8,7 +8,7 @@ Liholiswano is a Testnet-first rotating savings group platform for Botswana and 
 - Network: Stellar Testnet
 - Database: Render PostgreSQL
 - Web app: GitHub Pages workflow (.github/workflows/pages.yml)
-- Contract ID: CAGSH4W3EYKOBHV6TUZ2WMKHKMZP6NNID5PLERFEV2EG6TRZWBZRKLY
+- Contract ID: CBSBXWQFE3SOT3BOPVZ2IHK32PBUP5BFRHJLI6R2WH6WIQJQLV4WAYHO
 
 ## Implemented
 
