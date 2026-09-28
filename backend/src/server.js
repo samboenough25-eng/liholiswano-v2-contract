@@ -413,4 +413,6 @@ app.patch('/api/admin/users/:id/kyc',auth,role('owner','compliance'),async(req,r
  res.json({ok:true,status:p.data.status});
 });
 app.use((err,_,res,next)=>{console.error(err);if(res.headersSent)return next(err);res.status(500).json({error:'Internal server error'})});
-app.listen(Number(process.env.PORT||8080),()=>console.log('Liholiswano API started'));
+const runScheduledReconciliation=async()=>{try{const {stdout,stderr}=await execFileAsync(process.execPath,['src/reconcile.js'],{cwd:new URL('..',import.meta.url).pathname,timeout:120000,maxBuffer:1024*1024});console.log('Scheduled reconciliation completed',stdout.trim(),stderr.trim()||'')}catch(e){console.error('Scheduled reconciliation failed',e?.message||e)}};
+const reconciliationEnabled=process.env.ENABLE_INTERNAL_RECONCILIATION!=='false';
+app.listen(Number(process.env.PORT||8080),()=>{console.log('Liholiswano API started');if(reconciliationEnabled){setTimeout(runScheduledReconciliation,60000);setInterval(runScheduledReconciliation,15*60*1000);console.log('Internal reconciliation scheduler enabled (15-minute interval)')}});
