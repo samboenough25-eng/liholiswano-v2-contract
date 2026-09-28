@@ -4,7 +4,7 @@ window.LIHOLISWANO_MAINNET_CONFIG_TEMPLATE = {
   network: "mainnet",
   networkPassphrase: "Public Global Stellar Network ; September 2015",
   horizonUrl: "https://horizon.stellar.org",
-  rpcUrl: "REPLACE_WITH_SELECTED_MAINNET_SOROBAN_RPC_PROVIDER",
+  rpcUrl: "https://soroban-rpc.mainnet.stellar.gateway.fm",
   contractId: "REPLACE_AFTER_STAGE_5_MAINNET_DEPLOYMENT",
   usdcIssuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
   usdcSac: "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
