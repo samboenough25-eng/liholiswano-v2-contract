@@ -31,6 +31,12 @@ services:
         value: CBSBXWQFE3SOT3BOPVZ2IHK32PBUP5BFRHJLI6R2WH6WIQJQLV4WAYHO
       - key: KYC_PROVIDER
         value: stub
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: SMS_PROVIDER
+        value: africastalking
+      - key: AT_SMS_URL
+        value: https://api.africastalking.com/version1/messaging
       - key: PAYMENT_PROVIDER
         value: stellar
       - key: RECONCILE_SECRET
