@@ -21,7 +21,7 @@ const STELLAR_NETWORK=process.env.STELLAR_NETWORK||'testnet';
 const STELLAR_RPC_URL=process.env.STELLAR_RPC_URL||'https://soroban-testnet.stellar.org';
 const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false});
 app.use(helmet());
-const allowedOrigins=(process.env.CORS_ORIGIN||'').split(',').map(s=>s.trim()).filter(Boolean);
+const allowedOrigins=[...(process.env.CORS_ORIGIN||'').split(',').map(s=>s.trim()).filter(Boolean),'https://liholiswano-web.onrender.com','https://samboenough25-eng.github.io'].filter((v,i,a)=>a.indexOf(v)===i);
 if(process.env.NODE_ENV==='production' && !allowedOrigins.length) throw new Error('CORS_ORIGIN is required in production');
 if(process.env.NODE_ENV==='production' && STELLAR_NETWORK==='mainnet'){
  const required=[['RESEND_API_KEY',process.env.RESEND_API_KEY],['EMAIL_FROM',process.env.EMAIL_FROM],['SMS_PROVIDER_URL',process.env.SMS_PROVIDER_URL],['SMS_PROVIDER_API_KEY',process.env.SMS_PROVIDER_API_KEY],['RECONCILE_SECRET',process.env.RECONCILE_SECRET]];
