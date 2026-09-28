@@ -30,6 +30,7 @@ This document is the release gate for moving Liholiswano from the verified Stell
 - [ ] Final contract hash is recorded and reviewed.
 - [ ] Mainnet contract is deployed.
 - [ ] Mainnet initialization is completed with the intended administrator.
+- [ ] Verified Mainnet USDC SAC is allowlisted.
 - [ ] Mainnet contract read/invoke smoke tests pass.
 
 ### 2. Mainnet Stellar configuration
@@ -100,7 +101,7 @@ This document is the release gate for moving Liholiswano from the verified Stell
 2. Run the Mainnet readiness workflow.
 3. Independently verify Mainnet asset addresses.
 4. Configure production providers and secrets.
-5. Deploy the Mainnet contract.
+5. Deploy the Mainnet contract using the protected Mainnet deployment workflow.
 6. Initialize and verify the contract.
 7. Configure backend for Mainnet.
 8. Deploy backend and verify /health and production smoke tests.
@@ -108,6 +109,12 @@ This document is the release gate for moving Liholiswano from the verified Stell
 10. Run a controlled end-to-end transaction with a small operational amount.
 11. Review logs, reconciliation, database records, and on-chain records.
 12. Only then open the service for normal customer use.
+
+## Stage 5 deployment mechanism
+
+A protected workflow now exists at `.github/workflows/deploy-mainnet.yml`. It is manual, requires the `mainnet-production` GitHub Environment, requires the `STELLAR_MAINNET_DEPLOYER_SECRET` environment secret, validates the deployer against the supplied protocol-admin public key, verifies the Mainnet USDC SAC, deploys the final WASM, initializes the protocol administrator, allowlists Mainnet USDC, and performs a read/invoke verification. The workflow requires the literal confirmation `DEPLOY-MAINNET` and does not print private signing material.
+
+The workflow is intentionally not executable until the project owner configures the protected GitHub Environment and the production signing secret.
 
 ## Current blockers
 
