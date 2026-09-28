@@ -122,7 +122,7 @@ app.post('/internal/reconcile',async(req,res)=>{
 
 app.post('/api/auth/register',authLimiter,async(req,res)=>{
  const p=z.object({email:z.string().email(),password:z.string().min(12),fullName:z.string().min(2).max(120),country:z.enum(['BW','SZ'])}).safeParse(req.body);
- if(!p.success)return res.status(400).json({error:'Invalid registration data'});
+ if(!p.success)return res.status(400).json({error:'Invalid registration data',fields:p.error.flatten().fieldErrors});
  const x=p.data;
  try{
    const hash=await bcrypt.hash(x.password,12);
