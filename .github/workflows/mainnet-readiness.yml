@@ -1,0 +1,73 @@
+name: Mainnet readiness check (NO DEPLOYMENT)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mainnet_usdc_issuer:
+        description: "Verified Mainnet USDC issuer G... address"
+        required: true
+        type: string
+      expected_admin_public_key:
+        description: "Expected Mainnet protocol-admin G... address"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.79.0 with WASM target
+        uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v27.0.0
+
+      - name: Run contract tests
+        working-directory: contract-v2
+        run: cargo test --locked
+
+      - name: Build contract
+        working-directory: contract-v2
+        run: stellar contract build
+
+      - name: Verify WASM
+        working-directory: contract-v2
+        run: |
+          set -euo pipefail
+          test -f target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm
+          sha256sum target/wasm32-unknown-unknown/release/liholiswano_contract_v2.wasm
+
+      - name: Validate Mainnet configuration shape
+        env:
+          USDC_ISSUER: ${{ inputs.mainnet_usdc_issuer }}
+          EXPECTED_ADMIN: ${{ inputs.expected_admin_public_key }}
+        run: |
+          set -euo pipefail
+
+          if [ "${#USDC_ISSUER}" -ne 56 ] || [[ "$USDC_ISSUER" != G* ]]; then
+            echo "::error::USDC issuer must be a 56-character Stellar G... address."
+            exit 1
+          fi
+
+          if [ "${#EXPECTED_ADMIN}" -ne 56 ] || [[ "$EXPECTED_ADMIN" != G* ]]; then
+            echo "::error::Expected admin must be a 56-character Stellar G... address."
+            exit 1
+          fi
+
+          echo "Mainnet configuration inputs have valid address shape."
+
+      - name: Explicitly confirm that this workflow never deploys
+        run: |
+          echo "PASS: This workflow only builds/tests/validates."
+          echo "PASS: It does not deploy a contract."
+          echo "PASS: It does not initialize a contract."
+          echo "PASS: It does not approve assets."
+          echo "PASS: It does not modify frontend network configuration."
