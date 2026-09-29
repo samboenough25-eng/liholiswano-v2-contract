@@ -10,7 +10,7 @@ body{font-family:system-ui;margin:0;background:#f4f7f6;color:#14201b}header{back
 </main>
 <script src="testnet-config.js"></script><script src="https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@12.3.0/dist/stellar-sdk.min.js"></script>
 <script type="module">
-import {getAddress,isConnected,requestAccess,signTransaction} from 'https://esm.sh/@stellar/freighter-api';
+import {getAddress,isConnected,requestAccess,signTransaction} from 'https://esm.sh/@stellar/freighter-api@6.0.1';
 const API=(window.LIHOLISWANO_API_URL||'https://liholiswano-api.onrender.com')+'/api',TOKEN=localStorage.getItem('liholiswano_token');
 if(!TOKEN)location.href='platform.html';
 const CONTRACT=(window.LIHOLISWANO_TESTNET_CONFIG||{}).contractId||'',RPC_URL='https://soroban-testnet.stellar.org',PASS=StellarSdk.Networks.TESTNET;
