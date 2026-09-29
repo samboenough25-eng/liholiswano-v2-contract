@@ -13,6 +13,45 @@ import {execFile} from 'child_process';
 import {promisify} from 'util';
 const execFileAsync=promisify(execFile);
 
+// Maps each client-claimed transaction type to the exact Soroban function it must invoke.
+const CONTRACT_FUNCTION_BY_TYPE={
+  join:'join_group',
+  contribute:'contribute',
+  bid:'submit_bid',
+  settle:'settle_round',
+  refund:'claim_refund',
+  create_group:'create_group',
+  lock_group:'lock_group'
+};
+const MEMBER_SCOPED_TYPES=new Set(['join','contribute','bid','refund']);
+const ADMIN_ONLY_TYPES=new Set(['create_group','lock_group']);
+const EXPECTED_MEMBER_ARG_INDEX={join:1,contribute:1,bid:1,refund:1};
+
+function extractContractInvocations(envelopeXdrBase64){
+ if(!envelopeXdrBase64)return[];
+ let envelope;
+ try{envelope=stellarXdr.TransactionEnvelope.fromXDR(envelopeXdrBase64,'base64')}catch{return[]}
+ try{
+   const isFeeBump=envelope.switch().name==='envelopeTypeTxFeeBump';
+   const tx=isFeeBump?envelope.feeBump().tx().innerTx().v1().tx():envelope.v1().tx();
+   const invocations=[];
+   for(const op of tx.operations()){
+     if(op.body().switch().name!=='invokeHostFunction')continue;
+     const hostFn=op.body().invokeHostFunctionOp().hostFunction();
+     if(hostFn.switch().name!=='hostFunctionTypeInvokeContract')continue;
+     const invoke=hostFn.invokeContract();
+     try{
+       invocations.push({
+         contractAddress:StellarAddress.fromScAddress(invoke.contractAddress()).toString(),
+         functionName:invoke.functionName().toString(),
+         args:invoke.args().map(a=>scValToNative(a))
+       });
+     }catch{}
+   }
+   return invocations;
+ }catch{return[]}
+}
+
 const app=express();
 app.disable('x-powered-by');
 app.set('trust proxy',1);
@@ -271,14 +310,38 @@ app.get('/api/kyc/status',auth,verifiedAccount,async(req,res)=>{
 
 app.get('/api/transactions',auth,verifiedAccount,async(req,res)=>{const r=await pool.query('select id,group_id,type,asset,amount,stellar_hash,status,metadata,created_at from transactions where user_id=$1 order by created_at desc limit 100',[req.user.sub]);res.json(r.rows)});
 app.post('/api/transactions',auth,verifiedAccount,role('customer','owner','admin'),async(req,res)=>{
- const p=z.object({groupId:z.string().min(1).max(32).optional(),type:z.enum(['join','contribute','bid','settle','refund','default','create_group','lock_group']),asset:z.string().max(80).optional(),amount:z.number().finite().nonnegative().optional(),stellarHash:z.string().regex(/^[a-f0-9]{64}$/i),metadata:z.record(z.any()).default({})}).safeParse(req.body);
+ const p=z.object({groupId:z.string().min(1).max(32).optional(),type:z.enum(['join','contribute','bid','settle','refund','create_group','lock_group']),asset:z.string().max(80).optional(),amount:z.number().finite().nonnegative().optional(),stellarHash:z.string().regex(/^[a-f0-9]{64}$/i),metadata:z.record(z.any()).default({})}).safeParse(req.body);
  if(!p.success)return res.status(400).json({error:'Invalid transaction record'});
+ if(ADMIN_ONLY_TYPES.has(p.data.type)&&!['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Only the platform owner or admin can record this transaction type'});
+ if(!stellarContractId)return res.status(503).json({error:'Platform contract is not configured'});
  const existing=await pool.query('select id,status from transactions where stellar_hash=$1 limit 1',[p.data.stellarHash]);
  if(existing.rowCount)return res.status(409).json({error:'This Stellar transaction has already been recorded',transaction_id:existing.rows[0].id,status:existing.rows[0].status});
+ let chain;
+ try{chain=await stellarTransactionStatus(p.data.stellarHash)}catch{return res.status(503).json({error:'Could not verify the Stellar transaction yet. Try again shortly.'})}
  let chainStatus='pending';
- try{const chain=await stellarTransactionStatus(p.data.stellarHash);if(chain.status==='SUCCESS')chainStatus='confirmed';else if(chain.status==='FAILED')chainStatus='failed';}catch(e){return res.status(503).json({error:'Could not verify the Stellar transaction yet. Try again shortly.'});}
+ if(chain.status==='SUCCESS')chainStatus='confirmed';else if(chain.status==='FAILED')chainStatus='failed';
+ if(chainStatus==='confirmed'){
+   const expectedFn=CONTRACT_FUNCTION_BY_TYPE[p.data.type];
+   const invocation=extractContractInvocations(chain.envelopeXdr).find(x=>x.contractAddress===stellarContractId&&x.functionName===expectedFn);
+   if(!invocation){
+     await audit(req,'transaction.record.rejected',{type:p.data.type,stellar_hash:p.data.stellarHash,reason:'contract_call_mismatch'});
+     return res.status(409).json({error:'This Stellar transaction does not match the expected '+expectedFn+' call on the platform contract'});
+   }
+   if(p.data.groupId&&invocation.args[0]!==p.data.groupId){
+     await audit(req,'transaction.record.rejected',{type:p.data.type,stellar_hash:p.data.stellarHash,reason:'group_mismatch'});
+     return res.status(409).json({error:'This Stellar transaction does not match the given group ID'});
+   }
+   if(MEMBER_SCOPED_TYPES.has(p.data.type)){
+     const memberArg=invocation.args[EXPECTED_MEMBER_ARG_INDEX[p.data.type]];
+     const w=await pool.query('select public_key from wallets where user_id=$1 and network=$2',[req.user.sub,STELLAR_NETWORK]);
+     if(!w.rowCount||memberArg!==w.rows[0].public_key){
+       await audit(req,'transaction.record.rejected',{type:p.data.type,stellar_hash:p.data.stellarHash,reason:'member_mismatch'});
+       return res.status(409).json({error:'This Stellar transaction does not act on your linked wallet'});
+     }
+   }
+ }
  let r;
- try{ r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,chainStatus,p.data.metadata]);}catch(e){if(e?.code==='23505')return res.status(409).json({error:'This Stellar transaction has already been recorded'});throw e;}
+ try{r=await pool.query('insert into transactions(user_id,group_id,type,asset,amount,stellar_hash,status,metadata) values($1,$2,$3,$4,$5,$6,$7,$8) returning id,group_id,type,asset,amount,stellar_hash,status,created_at',[req.user.sub,p.data.groupId||null,p.data.type,p.data.asset||null,p.data.amount??null,p.data.stellarHash,chainStatus,p.data.metadata])}catch(e){if(e?.code==='23505')return res.status(409).json({error:'This Stellar transaction has already been recorded'});throw e}
  await audit(req,'transaction.recorded',{type:p.data.type,stellar_hash:p.data.stellarHash,group_id:p.data.groupId||null,status:chainStatus});
  res.status(chainStatus==='confirmed'?201:202).json(r.rows[0]);
 });
