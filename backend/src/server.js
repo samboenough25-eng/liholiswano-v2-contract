@@ -11,6 +11,7 @@ import {z} from 'zod';
 import {createHostedKycSession,confirmCallbackSignature,normalizeKycDecision,kycConfigured} from './smile-id.js';
 import {execFile} from 'child_process';
 import {promisify} from 'util';
+import {xdr as stellarXdr,Address as StellarAddress,scValToNative} from '@stellar/stellar-sdk';
 const execFileAsync=promisify(execFile);
 
 // Maps each client-claimed transaction type to the exact Soroban function it must invoke.
