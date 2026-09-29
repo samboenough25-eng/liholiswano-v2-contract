@@ -1,3 +1,7 @@
 
 contract-v2/target/
 contract-v2/test_snapshots/
+
+.env
+.env.*
+!.env.example
